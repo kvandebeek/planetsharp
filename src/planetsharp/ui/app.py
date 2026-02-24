@@ -1,21 +1,21 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
-import time
+import threading
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import filedialog, messagebox, simpledialog, ttk
+from tkinter import filedialog, messagebox, ttk
 from typing import Any, Callable
 
-from planetsharp.core.models import BlockInstance, InputImage, Role, Session
+from planetsharp.core.models import BlockInstance, Session
 from planetsharp.io.formats import read_image, write_image
-from planetsharp.persistence.session_store import SessionStore
+from planetsharp.persistence.template_store import TEMPLATE_SUFFIX, TemplateStore
 from planetsharp.processing.blocks import BLOCK_DEFINITIONS
 
 LAYOUT_STATE = Path.home() / ".planetsharp.layout.json"
-PROJECT_SUFFIX = ".planetsharp"
 
 
 @dataclass
@@ -65,23 +65,27 @@ class PlanetSharpApp:
 
         self.status = tk.StringVar(value="Ready")
         self.viewer_mode = tk.StringVar(value="Before")
-        self.live_preview = tk.BooleanVar(value=True)
         self.selected_stage = tk.IntVar(value=1)
 
         self.loaded_image: dict[str, Any] | None = None
         self.loaded_image_path: str | None = None
-        self.current_project_path: str | None = None
-        self.stage_cache: dict[str, dict[str, Any] | None] = {"stage1": None, "stage2": None, "full": None}
-
-        self.history = History()
+        self.processed_image: dict[str, Any] | None = None
         self.selected_block_id: str | None = None
+        self.history = History()
+
+        self._last_pipeline_sigs: list[str] = []
+        self._block_cache: dict[str, dict[str, Any]] = {}
+        self._debounce_id: str | None = None
+        self._generation = 0
+        self._processing_thread: threading.Thread | None = None
+        self._drag_from_library: str | None = None
+        self._drag_block_id: str | None = None
 
         self._build_layout()
         self._bind_shortcuts()
         self._restore_ui_state()
         self._seed_pipeline()
         self._refresh_pipeline_views()
-        self._refresh_viewer_mode_options()
         self._refresh_viewer()
 
     def _seed_pipeline(self) -> None:
@@ -90,10 +94,20 @@ class PlanetSharpApp:
                 self.session.stage2_blocks.append(BlockInstance(type=code, params=dict(BLOCK_DEFINITIONS[code].defaults)))
 
     def _build_layout(self) -> None:
-        self._build_toolbar()
+        bar = ttk.Frame(self.root)
+        bar.pack(fill="x", padx=6, pady=4)
+        for label, cmd in [
+            ("Open", self._open_any),
+            ("Save", self._save_template),
+            ("Export", self._export_image),
+            ("Undo", self._undo),
+            ("Redo", self._redo),
+        ]:
+            ttk.Button(bar, text=label, command=cmd).pack(side="left", padx=2)
+        ttk.Label(bar, textvariable=self.status).pack(side="right")
+
         self.main = ttk.Panedwindow(self.root, orient="horizontal")
         self.main.pack(fill="both", expand=True)
-
         left = ttk.Frame(self.main)
         center = ttk.Frame(self.main)
         right = ttk.Frame(self.main)
@@ -101,115 +115,72 @@ class PlanetSharpApp:
         self.main.add(center, weight=6)
         self.main.add(right, weight=3)
 
-        self._build_library(left)
-        self._build_center(center)
-        self._build_inspector(right)
-
-    def _build_toolbar(self) -> None:
-        bar = ttk.Frame(self.root)
-        bar.pack(fill="x", padx=6, pady=4)
-        for label, cmd in [
-            ("Open", self._open_image),
-            ("Save", self._save_project),
-            ("Export", self._export_image),
-            ("Undo", self._undo),
-            ("Redo", self._redo),
-            ("Run stage 1", self._run_stage1),
-            ("Run stage 2", self._run_stage2),
-            ("Run pipeline", self._run_pipeline),
-        ]:
-            ttk.Button(bar, text=label, command=cmd).pack(side="left", padx=2)
-        ttk.Checkbutton(bar, text="Live Preview", variable=self.live_preview).pack(side="left", padx=8)
-        ttk.Label(bar, textvariable=self.status).pack(side="right")
-
-    def _build_library(self, parent: ttk.Frame) -> None:
-        ttk.Label(parent, text="Building Blocks Library").pack(anchor="w", padx=4, pady=4)
-        self.library = tk.Listbox(parent, exportselection=False)
+        ttk.Label(left, text="Building Blocks Library").pack(anchor="w", padx=4, pady=4)
+        self.library = tk.Listbox(left, exportselection=False, height=16)
         self.library.pack(fill="both", expand=True, padx=4, pady=4)
         for code in sorted(BLOCK_DEFINITIONS):
-            self.library.insert("end", code)
-        ttk.Button(parent, text="Add to selected stage", command=self._add_library_block).pack(fill="x", padx=4, pady=4)
+            name = BLOCK_DEFINITIONS[code].display_name
+            self.library.insert("end", f"{name} ({code})")
+        self.library.bind("<ButtonPress-1>", self._start_library_drag)
+        ttk.Button(left, text="Add to selected stage", command=self._add_library_block).pack(fill="x", padx=4, pady=4)
 
-    def _build_center(self, parent: ttk.Frame) -> None:
-        viewer = ttk.LabelFrame(parent, text="Viewer")
+        viewer = ttk.LabelFrame(center, text="Viewer")
         viewer.pack(fill="both", expand=True, padx=4, pady=4)
         row = ttk.Frame(viewer)
         row.pack(fill="x", padx=4, pady=4)
         ttk.Label(row, text="Mode").pack(side="left")
-        self.viewer_combo = ttk.Combobox(row, textvariable=self.viewer_mode, state="readonly", width=20)
+        self.viewer_combo = ttk.Combobox(row, textvariable=self.viewer_mode, state="readonly", values=["Before", "After"], width=20)
         self.viewer_combo.pack(side="left", padx=4)
         self.viewer_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_viewer())
-        ttk.Button(row, text="Fit", command=self._fit_viewer).pack(side="left", padx=4)
-
+        ttk.Button(row, text="Fit", command=self._refresh_viewer).pack(side="left", padx=4)
         self.viewer_canvas = tk.Canvas(viewer, background="#111", height=380)
         self.viewer_canvas.pack(fill="both", expand=True, padx=4, pady=4)
 
-        pipeline = ttk.LabelFrame(parent, text="Pipeline Canvas")
+        pipeline = ttk.LabelFrame(center, text="Pipeline Canvas")
         pipeline.pack(fill="both", expand=True, padx=4, pady=4)
-
-        s1_header = ttk.Label(pipeline, text="Stage 1 — Preprocessing", font=("TkDefaultFont", 10, "bold"))
-        s1_header.pack(fill="x", padx=4, pady=(4, 2))
+        ttk.Label(pipeline, text="Stage 1 — Preprocessing", font=("TkDefaultFont", 10, "bold")).pack(fill="x", padx=4, pady=(4, 2))
         self.stage1_tree = self._make_stage_tree(pipeline)
-
-        divider = ttk.Separator(pipeline, orient="horizontal")
-        divider.pack(fill="x", padx=4, pady=8)
-
-        s2_header = ttk.Label(pipeline, text="Stage 2 — Enhancement", font=("TkDefaultFont", 10, "bold"))
-        s2_header.pack(fill="x", padx=4, pady=(2, 2))
+        ttk.Separator(pipeline, orient="horizontal").pack(fill="x", padx=4, pady=8)
+        ttk.Label(pipeline, text="Stage 2 — Enhancement", font=("TkDefaultFont", 10, "bold")).pack(fill="x", padx=4, pady=(2, 2))
         self.stage2_tree = self._make_stage_tree(pipeline)
 
         for tree, stage in ((self.stage1_tree, 1), (self.stage2_tree, 2)):
             tree.bind("<<TreeviewSelect>>", lambda _e, s=stage: self._on_select(s))
-            tree.bind("<Button-3>", lambda e, s=stage: self._show_context_menu(e, s))
+            tree.bind("<ButtonPress-1>", lambda e, s=stage: self._start_tree_drag(e, s))
+            tree.bind("<ButtonRelease-1>", lambda e, s=stage: self._drop_on_tree(e, s))
 
         controls = ttk.Frame(pipeline)
         controls.pack(fill="x", padx=4, pady=4)
-        for label, cmd in [
-            ("▲", self._move_up),
-            ("▼", self._move_down),
-            ("Enable/Disable", self._toggle_enabled),
-            ("Duplicate", self._duplicate_selected),
-            ("Delete", self._delete_selected),
-            ("Apply", self._run_pipeline),
-        ]:
+        for label, cmd in [("▲", self._move_up), ("▼", self._move_down), ("Enable/Disable", self._toggle_enabled), ("Duplicate", self._duplicate_selected), ("Delete", self._delete_selected)]:
             ttk.Button(controls, text=label, command=cmd).pack(side="left", padx=2)
 
-    def _make_stage_tree(self, parent: ttk.Widget) -> ttk.Treeview:
-        tree = ttk.Treeview(parent, columns=("enabled", "name"), show="headings", selectmode="browse", height=6)
-        tree.heading("enabled", text="On")
-        tree.heading("name", text="Block")
-        tree.column("enabled", width=45, anchor="center")
-        tree.column("name", width=300, anchor="w")
-        tree.pack(fill="x", padx=4)
-        return tree
-
-    def _build_inspector(self, parent: ttk.Frame) -> None:
-        inspector = ttk.LabelFrame(parent, text="Block parameters")
+        inspector = ttk.LabelFrame(right, text="Block parameters")
         inspector.pack(fill="both", expand=True, padx=4, pady=4)
         self.param_area = ttk.Frame(inspector)
         self.param_area.pack(fill="both", expand=True, padx=4, pady=4)
+
+    def _make_stage_tree(self, parent: ttk.Widget) -> ttk.Treeview:
+        tree = ttk.Treeview(parent, columns=("enabled", "name"), show="headings", selectmode="browse", height=6)
+        tree.heading("enabled", text="Enabled")
+        tree.heading("name", text="Block")
+        tree.column("enabled", width=80, anchor="center")
+        tree.column("name", width=320, anchor="w")
+        tree.pack(fill="x", padx=4)
+        return tree
 
     def _bind_shortcuts(self) -> None:
         self.root.bind("<Control-z>", lambda *_: self._undo())
         self.root.bind("<Control-y>", lambda *_: self._redo())
 
-    def _active_stage_blocks(self) -> list[BlockInstance]:
-        return self.session.stage1_blocks if self.selected_stage.get() == 1 else self.session.stage2_blocks
+    def _pipeline_blocks(self) -> list[BlockInstance]:
+        return self.session.stage1_blocks + self.session.stage2_blocks
 
     def _refresh_pipeline_views(self) -> None:
         for tree, blocks in ((self.stage1_tree, self.session.stage1_blocks), (self.stage2_tree, self.session.stage2_blocks)):
             tree.delete(*tree.get_children())
             for block in blocks:
-                tree.insert("", "end", iid=block.id, values=("☑" if block.enabled else "☐", block.type))
-
-        available_ids = {b.id for b in (self.session.stage1_blocks + self.session.stage2_blocks)}
-        if self.selected_block_id not in available_ids:
-            self.selected_block_id = None
-        if self.selected_block_id:
-            for tree in (self.stage1_tree, self.stage2_tree):
-                if self.selected_block_id in tree.get_children():
-                    tree.selection_set(self.selected_block_id)
-
+                name = BLOCK_DEFINITIONS[block.type].display_name
+                tree.insert("", "end", iid=block.id, values=("☑" if block.enabled else "☐", f"{name} ({block.type})"))
         self._render_param_editor()
 
     def _on_select(self, stage: int) -> None:
@@ -218,14 +189,11 @@ class PlanetSharpApp:
         if not sel:
             return
         self.selected_stage.set(stage)
-        self.session.selected_stage = stage
         self.selected_block_id = sel[0]
-        other = self.stage2_tree if stage == 1 else self.stage1_tree
-        other.selection_remove(other.selection())
         self._render_param_editor()
 
     def _selected_block(self) -> BlockInstance | None:
-        for block in self.session.stage1_blocks + self.session.stage2_blocks:
+        for block in self._pipeline_blocks():
             if block.id == self.selected_block_id:
                 return block
         return None
@@ -237,13 +205,9 @@ class PlanetSharpApp:
         if not block:
             ttk.Label(self.param_area, text="Select a block.").pack(anchor="w")
             return
-        ttk.Label(self.param_area, text=f"{block.type}", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 4))
-
+        ttk.Label(self.param_area, text=f"{BLOCK_DEFINITIONS[block.type].display_name} ({block.type})", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 4))
         for key, value in block.params.items():
-            if isinstance(value, bool):
-                var = tk.BooleanVar(value=value)
-                ttk.Checkbutton(self.param_area, text=key, variable=var, command=lambda k=key, v=var: self._set_param(k, v.get())).pack(anchor="w")
-            elif isinstance(value, (int, float)):
+            if isinstance(value, (int, float)):
                 row = ttk.Frame(self.param_area)
                 row.pack(fill="x", pady=2)
                 ttk.Label(row, text=key, width=18).pack(side="left")
@@ -251,50 +215,63 @@ class PlanetSharpApp:
                 scale = ttk.Scale(row, from_=0, to=max(2.0, float(value) * 2 + 1), variable=var, command=lambda _v, k=key, v=var: self._set_param(k, v.get()))
                 scale.pack(side="left", fill="x", expand=True, padx=4)
 
+    def _active_stage_blocks(self) -> list[BlockInstance] | None:
+        stage = self.selected_stage.get()
+        if stage == 1:
+            return self.session.stage1_blocks
+        if stage == 2:
+            return self.session.stage2_blocks
+        return None
+
     def _set_param(self, key: str, value: Any) -> None:
         block = self._selected_block()
         if not block:
             return
         old = block.params.get(key)
-        new = round(float(value), 4) if isinstance(value, (float, int)) else value
+        new = round(float(value), 4)
         if old == new:
             return
 
         def do() -> None:
             block.params[key] = new
-            self._invalidate_cache()
-            self._render_param_editor()
-            self._auto_preview()
+            self._schedule_processing("parameter")
 
         def undo() -> None:
             block.params[key] = old
-            self._invalidate_cache()
-            self._render_param_editor()
-            self._auto_preview()
+            self._schedule_processing("parameter")
 
-        self.history.execute(Command(do=do, undo=undo, description=f"Param {key}"))
+        self.history.execute(Command(do=do, undo=undo, description="Param"))
 
-    def _add_library_block(self) -> None:
+    def _code_from_library_selection(self) -> str | None:
         sel = self.library.curselection()
         if not sel:
+            return None
+        text = self.library.get(sel[0])
+        return text.rsplit("(", 1)[-1].rstrip(")")
+
+    def _add_library_block(self) -> None:
+        code = self._code_from_library_selection()
+        if not code:
             return
-        code = self.library.get(sel[0])
         blocks = self._active_stage_blocks()
+        if blocks is None:
+            messagebox.showinfo("PlanetSharp", "Select Stage 1 or Stage 2 before adding a block.")
+            return
         block = BlockInstance(type=code, params=dict(BLOCK_DEFINITIONS[code].defaults))
 
         def do() -> None:
             blocks.append(block)
             self.selected_block_id = block.id
-            self._invalidate_cache()
             self._refresh_pipeline_views()
+            self._schedule_processing("add")
 
         def undo() -> None:
             blocks.remove(block)
             self.selected_block_id = None
-            self._invalidate_cache()
             self._refresh_pipeline_views()
+            self._schedule_processing("remove")
 
-        self.history.execute(Command(do=do, undo=undo, description="Add block"))
+        self.history.execute(Command(do=do, undo=undo, description="Add"))
 
     def _toggle_enabled(self) -> None:
         block = self._selected_block()
@@ -304,15 +281,13 @@ class PlanetSharpApp:
 
         def do() -> None:
             block.enabled = not old
-            self._invalidate_cache()
             self._refresh_pipeline_views()
-            self._auto_preview()
+            self._schedule_processing("toggle")
 
         def undo() -> None:
             block.enabled = old
-            self._invalidate_cache()
             self._refresh_pipeline_views()
-            self._auto_preview()
+            self._schedule_processing("toggle")
 
         self.history.execute(Command(do=do, undo=undo, description="Toggle"))
 
@@ -323,9 +298,9 @@ class PlanetSharpApp:
         self._move_selected(1)
 
     def _move_selected(self, delta: int) -> None:
-        blocks = self._active_stage_blocks()
         block = self._selected_block()
-        if not block or block not in blocks:
+        blocks = self._active_stage_blocks()
+        if not block or blocks is None or block not in blocks:
             return
         src = blocks.index(block)
         dst = src + delta
@@ -334,36 +309,28 @@ class PlanetSharpApp:
 
         def do() -> None:
             blocks[src], blocks[dst] = blocks[dst], blocks[src]
-            self._invalidate_cache()
             self._refresh_pipeline_views()
-            self._auto_preview()
+            self._schedule_processing("reorder")
 
-        def undo() -> None:
-            blocks[src], blocks[dst] = blocks[dst], blocks[src]
-            self._invalidate_cache()
-            self._refresh_pipeline_views()
-            self._auto_preview()
-
-        self.history.execute(Command(do=do, undo=undo, description="Reorder"))
+        self.history.execute(Command(do=do, undo=do, description="Reorder"))
 
     def _duplicate_selected(self) -> None:
         block = self._selected_block()
-        if not block:
-            return
         blocks = self._active_stage_blocks()
+        if not block or blocks is None:
+            return
         clone = BlockInstance(type=block.type, enabled=block.enabled, params=copy.deepcopy(block.params))
 
         def do() -> None:
             blocks.append(clone)
             self.selected_block_id = clone.id
-            self._invalidate_cache()
             self._refresh_pipeline_views()
+            self._schedule_processing("duplicate")
 
         def undo() -> None:
             blocks.remove(clone)
-            self.selected_block_id = block.id
-            self._invalidate_cache()
             self._refresh_pipeline_views()
+            self._schedule_processing("duplicate")
 
         self.history.execute(Command(do=do, undo=undo, description="Duplicate"))
 
@@ -377,112 +344,124 @@ class PlanetSharpApp:
         def do() -> None:
             blocks.remove(block)
             self.selected_block_id = None
-            self._invalidate_cache()
             self._refresh_pipeline_views()
+            self._schedule_processing("delete")
 
         def undo() -> None:
             blocks.insert(idx, block)
             self.selected_block_id = block.id
-            self._invalidate_cache()
             self._refresh_pipeline_views()
+            self._schedule_processing("delete")
 
         self.history.execute(Command(do=do, undo=undo, description="Delete"))
 
-    def _show_context_menu(self, event: tk.Event, stage: int) -> None:
+    def _start_library_drag(self, _event: tk.Event) -> None:
+        self._drag_from_library = self._code_from_library_selection()
+
+    def _start_tree_drag(self, event: tk.Event, stage: int) -> None:
         tree = self.stage1_tree if stage == 1 else self.stage2_tree
         row = tree.identify_row(event.y)
-        if not row:
-            return
-        tree.selection_set(row)
-        self._on_select(stage)
-        menu = tk.Menu(self.root, tearoff=0)
-        menu.add_command(label="Move to stage 1", command=lambda: self._move_block_to_stage(1))
-        menu.add_command(label="Move to stage 2", command=lambda: self._move_block_to_stage(2))
-        menu.tk_popup(event.x_root, event.y_root)
+        self._drag_block_id = row or None
 
-    def _move_block_to_stage(self, target_stage: int) -> None:
+    def _drop_on_tree(self, event: tk.Event, stage: int) -> None:
+        tree = self.stage1_tree if stage == 1 else self.stage2_tree
+        target_blocks = self.session.stage1_blocks if stage == 1 else self.session.stage2_blocks
+        target_row = tree.identify_row(event.y)
+        insert_index = len(target_blocks)
+        if target_row:
+            insert_index = target_blocks.index(next(b for b in target_blocks if b.id == target_row))
+        if self._drag_from_library:
+            block = BlockInstance(type=self._drag_from_library, params=dict(BLOCK_DEFINITIONS[self._drag_from_library].defaults))
+            target_blocks.insert(insert_index, block)
+            self._drag_from_library = None
+            self._refresh_pipeline_views()
+            self._schedule_processing("drag-insert")
+            return
+        if not self._drag_block_id:
+            return
         block = self._selected_block()
         if not block:
             return
         src_blocks = self.session.stage1_blocks if block in self.session.stage1_blocks else self.session.stage2_blocks
-        dst_blocks = self.session.stage1_blocks if target_stage == 1 else self.session.stage2_blocks
-        if src_blocks is dst_blocks:
-            return
-        src_idx = src_blocks.index(block)
-
-        def do() -> None:
+        if block in target_blocks:
             src_blocks.remove(block)
-            dst_blocks.append(block)
-            self.selected_stage.set(target_stage)
-            self.selected_block_id = block.id
-            self._invalidate_cache()
-            self._refresh_pipeline_views()
+            target_blocks.insert(min(insert_index, len(target_blocks)), block)
+        else:
+            src_blocks.remove(block)
+            target_blocks.insert(insert_index, block)
+        self.selected_stage.set(stage)
+        self._drag_block_id = None
+        self._refresh_pipeline_views()
+        self._schedule_processing("drag-move")
 
-        def undo() -> None:
-            dst_blocks.remove(block)
-            src_blocks.insert(src_idx, block)
-            self.selected_stage.set(1 if src_blocks is self.session.stage1_blocks else 2)
-            self.selected_block_id = block.id
-            self._invalidate_cache()
-            self._refresh_pipeline_views()
+    def _block_signature(self, block: BlockInstance) -> str:
+        payload = {"type": block.type, "enabled": block.enabled, "params": block.params}
+        return json.dumps(payload, sort_keys=True, default=str)
 
-        self.history.execute(Command(do=do, undo=undo, description="Move stage"))
+    def _schedule_processing(self, reason: str) -> None:
+        if self._debounce_id:
+            self.root.after_cancel(self._debounce_id)
+        self._debounce_id = self.root.after(100, lambda: self._start_processing(reason))
 
-    def _run_blocks(self, blocks: list[BlockInstance], input_image: dict[str, Any], stage_name: str) -> dict[str, Any]:
-        signal = sum((idx + 1) * 0.01 for idx, b in enumerate(blocks) if b.enabled)
-        output = dict(input_image)
-        output["signal"] = round(signal, 4)
-        output["stage"] = stage_name
-        output["blocks"] = [b.type for b in blocks if b.enabled]
-        return output
-
-    def _run_stage1(self) -> None:
+    def _start_processing(self, reason: str) -> None:
         if not self.loaded_image:
+            self.processed_image = None
+            self._refresh_viewer()
             return
-        self.stage_cache["stage1"] = self._run_blocks(self.session.stage1_blocks, self.loaded_image, "stage1")
-        self.stage_cache["full"] = None
-        self._refresh_viewer_mode_options()
-        self.status.set("Stage 1 complete")
-        self._refresh_viewer()
+        self._generation += 1
+        generation = self._generation
+        signatures = [self._block_signature(b) for b in self._pipeline_blocks()]
+        start = 0
+        for idx, (old, new) in enumerate(zip(self._last_pipeline_sigs, signatures)):
+            if old != new:
+                start = idx
+                break
+            start = idx + 1
+        start = min(start, len(signatures))
+        self.status.set(f"Processing… ({reason})")
+        print(f"[pipeline] recompute_start={start}")
 
-    def _run_stage2(self) -> None:
-        if not self.loaded_image:
-            return
-        stage2_input = self.stage_cache["stage1"] or self.loaded_image
-        self.stage_cache["stage2"] = self._run_blocks(self.session.stage2_blocks, stage2_input, "stage2")
-        self.stage_cache["full"] = self.stage_cache["stage2"]
-        self._refresh_viewer_mode_options()
-        self.status.set("Stage 2 complete")
-        self._refresh_viewer()
+        def worker() -> None:
+            upstream = self.loaded_image
+            upstream_key = hashlib.sha1((self.loaded_image.get("path", "") + str(self.loaded_image.get("format", ""))).encode()).hexdigest()
+            for idx, block in enumerate(self._pipeline_blocks()):
+                sig = signatures[idx]
+                key = hashlib.sha1(f"{upstream_key}|{sig}".encode()).hexdigest()
+                if idx < start and key in self._block_cache:
+                    upstream = self._block_cache[key]
+                    upstream_key = key
+                    print(f"[pipeline] cache-hit idx={idx}")
+                    continue
+                print(f"[pipeline] cache-miss idx={idx}")
+                if generation != self._generation:
+                    return
+                out = dict(upstream)
+                out["signal"] = round(float(out.get("signal", 0.0)) + ((idx + 1) * 0.01 if block.enabled else 0.0), 4)
+                out["last_block"] = block.type
+                self._block_cache[key] = out
+                upstream = out
+                upstream_key = key
+            if generation != self._generation:
+                return
+            self._last_pipeline_sigs = signatures
+            self.root.after(0, lambda: self._finish_processing(upstream))
 
-    def _run_pipeline(self) -> None:
-        if not self.loaded_image:
-            return
-        self._run_stage1()
-        self._run_stage2()
-        self.status.set("Pipeline complete")
+        self._processing_thread = threading.Thread(target=worker, daemon=True)
+        self._processing_thread.start()
 
-    def _source_for_mode(self, mode: str) -> dict[str, Any] | None:
-        if mode == "Before":
-            return self.loaded_image
-        if mode == "Stage 1 output":
-            return self.stage_cache["stage1"]
-        if mode == "Stage 2 output":
-            return self.stage_cache["stage2"]
-        if mode == "Full pipeline":
-            return self.stage_cache["full"]
-        return self.loaded_image
-
-    def _fit_viewer(self) -> None:
-        self.session.viewer_state.zoom = 1.0
-        self.status.set("Viewer fit")
+    def _finish_processing(self, output: dict[str, Any]) -> None:
+        self.processed_image = output
+        self.status.set("Ready")
         self._refresh_viewer()
 
     def _refresh_viewer(self) -> None:
         self.viewer_canvas.delete("all")
-        source = self._source_for_mode(self.viewer_mode.get())
-        if not source:
+        if not self.loaded_image:
             self.viewer_canvas.create_text(420, 180, fill="white", text="No image loaded")
+            return
+        source = self.loaded_image if self.viewer_mode.get() == "Before" else self.processed_image
+        if source is None:
+            self.viewer_canvas.create_text(420, 180, fill="white", text="Processing…")
             return
         label = Path(source.get("path", "")).name or "image"
         mode = self.viewer_mode.get()
@@ -490,122 +469,72 @@ class PlanetSharpApp:
         self.viewer_canvas.create_text(420, 140, fill="white", text=f"{label}")
         self.viewer_canvas.create_text(420, 180, fill="#90ee90", text=f"Mode: {mode}")
         self.viewer_canvas.create_text(420, 220, fill="#cccccc", text=f"Signal: {source.get('signal', 0.0)}")
-        self.viewer_canvas.update_idletasks()
 
-    def _refresh_viewer_mode_options(self) -> None:
-        modes = ["Before"]
-        if self.stage_cache["stage1"] is not None:
-            modes.append("Stage 1 output")
-        if self.stage_cache["stage2"] is not None:
-            modes.append("Stage 2 output")
-        if self.stage_cache["full"] is not None:
-            modes.append("Full pipeline")
-        modes.extend(["Split", "Blink"])
-        self.viewer_combo["values"] = modes
-        if self.viewer_mode.get() not in modes:
-            self.viewer_mode.set("Before")
-
-    def _invalidate_cache(self) -> None:
-        self.stage_cache = {"stage1": None, "stage2": None, "full": None}
-        self._refresh_viewer_mode_options()
-
-    def _auto_preview(self) -> None:
-        if self.live_preview.get() and self.loaded_image:
-            self._run_pipeline()
-
-    def _open_image(self) -> None:
+    def _open_any(self) -> None:
         path = filedialog.askopenfilename(
-            title="Open image",
-            filetypes=[("Image", "*.png *.bmp *.tif *.tiff *.jpg *.jpeg *.xisf *.fits")],
+            title="Open image or template",
+            filetypes=[("Image/Template", f"*.png *.bmp *.tif *.tiff *.jpg *.jpeg *.xisf *.fits *{TEMPLATE_SUFFIX}"), ("Template", f"*{TEMPLATE_SUFFIX}")],
         )
         if not path:
             return
+        if path.endswith(TEMPLATE_SUFFIX):
+            self._open_template(path)
+        else:
+            self._open_image(path)
+
+    def _open_image(self, path: str) -> None:
         try:
-            image = read_image(path)
+            self.loaded_image = read_image(path)
         except ValueError as exc:
             messagebox.showerror("PlanetSharp", str(exc))
             return
-
-        self.loaded_image = image
         self.loaded_image_path = path
-        self._invalidate_cache()
+        self.processed_image = None
         self.viewer_mode.set("Before")
-        self._fit_viewer()
         self.status.set(f"Loaded {Path(path).name}")
+        self._refresh_viewer()
+        self._schedule_processing("image-load")
 
-        if self.live_preview.get():
-            self._run_pipeline()
-        else:
-            self._refresh_viewer()
+    def _open_template(self, path: str) -> None:
+        try:
+            loaded = TemplateStore.load(path)
+        except Exception as exc:
+            messagebox.showerror("PlanetSharp", f"Template load failed: {exc}")
+            return
+        self.session.stage1_blocks = loaded["stage1"]
+        self.session.stage2_blocks = loaded["stage2"]
+        self.selected_block_id = None
+        self._refresh_pipeline_views()
+        self.status.set(f"Loaded template {Path(path).name}")
+        self._schedule_processing("template-load")
 
-        self.history.clear()
-
-    def _save_project(self) -> None:
-        path = self.current_project_path
-        if not path:
-            path = filedialog.asksaveasfilename(
-                title="Save project",
-                defaultextension=PROJECT_SUFFIX,
-                filetypes=[("PlanetSharp Project", f"*{PROJECT_SUFFIX}")],
-            )
+    def _save_template(self) -> None:
+        path = filedialog.asksaveasfilename(title="Save template", defaultextension=TEMPLATE_SUFFIX, filetypes=[("PlanetSharp Template", f"*{TEMPLATE_SUFFIX}")])
         if not path:
             return
-        self.current_project_path = path
-
-        self.session.stage1_blocks = self.session.stage1_blocks
-        self.session.stage2_blocks = self.session.stage2_blocks
-        self.session.stage2_workflow.blocks = list(self.session.stage2_blocks)
-        self.session.viewer_state.stage_display = self.viewer_mode.get()
-        self.session.viewer_state.zoom = 1.0
-        if self.loaded_image_path:
-            self.session.inputs = [InputImage(path=self.loaded_image_path, role=Role.FILTER)]
-
-        SessionStore.save(path, self.session)
-        self.status.set(f"Saved project: {Path(path).name}")
+        TemplateStore.save(path, self.session)
+        self.status.set(f"Saved template {Path(path).name}")
 
     def _export_image(self) -> None:
-        if not self.loaded_image:
-            return
-        target = simpledialog.askstring("Export", "Target (stage1/stage2/full):", initialvalue="full", parent=self.root)
-        if not target:
-            return
-        target = target.lower().strip()
-
-        if target == "stage1" and self.stage_cache["stage1"] is None:
-            self._run_stage1()
-        elif target in {"stage2", "full"} and self.stage_cache["stage2"] is None:
-            self._run_pipeline()
-
-        source = {
-            "stage1": self.stage_cache["stage1"],
-            "stage2": self.stage_cache["stage2"],
-            "full": self.stage_cache["full"],
-        }.get(target)
+        source = self.loaded_image if self.viewer_mode.get() == "Before" else self.processed_image
         if source is None:
-            messagebox.showerror("PlanetSharp", "Requested output unavailable")
+            messagebox.showerror("PlanetSharp", "No image loaded")
             return
-
-        path = filedialog.asksaveasfilename(
-            title="Export image",
-            defaultextension=".png",
-            filetypes=[("PNG", "*.png"), ("TIFF", "*.tiff"), ("JPG", "*.jpg")],
-        )
+        path = filedialog.asksaveasfilename(title="Export image", defaultextension=".png", filetypes=[("PNG", "*.png"), ("TIFF", "*.tiff"), ("JPG", "*.jpg")])
         if not path:
             return
         write_image(path, source, bit_depth=16)
-        self.status.set(f"Exported {Path(path).name}")
+        self.status.set(f"Exported {Path(path).name} ({self.viewer_mode.get()})")
 
     def _undo(self) -> None:
         if self.history.undo():
-            self.status.set("Undo")
             self._refresh_pipeline_views()
-            self._refresh_viewer()
+            self._schedule_processing("undo")
 
     def _redo(self) -> None:
         if self.history.redo():
-            self.status.set("Redo")
             self._refresh_pipeline_views()
-            self._refresh_viewer()
+            self._schedule_processing("redo")
 
     def _save_ui_state(self) -> None:
         state = {"viewer_mode": self.viewer_mode.get(), "geometry": self.root.geometry()}
