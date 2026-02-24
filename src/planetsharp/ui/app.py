@@ -1,60 +1,59 @@
 from __future__ import annotations
 
+import copy
 import json
 import time
 import tkinter as tk
-from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import messagebox, simpledialog, ttk
-from typing import Any
+from tkinter import filedialog, messagebox, simpledialog, ttk
+from typing import Any, Callable
 
-from planetsharp.core.models import BlockInstance, Session
+from planetsharp.core.models import BlockInstance, InputImage, Role, Session
+from planetsharp.io.formats import read_image, write_image
+from planetsharp.persistence.session_store import SessionStore
 from planetsharp.processing.blocks import BLOCK_DEFINITIONS
 
 LAYOUT_STATE = Path.home() / ".planetsharp.layout.json"
+PROJECT_SUFFIX = ".planetsharp"
 
 
 @dataclass
-class LibraryItem:
-    code: str
-    name: str
+class Command:
+    do: Callable[[], None]
+    undo: Callable[[], None]
     description: str
-    category: str
 
 
-BLOCK_LIBRARY: list[LibraryItem] = [
-    LibraryItem("DECON", "Deconvolution", "Sharpen using PSF-aware iterative recovery.", "Sharpening"),
-    LibraryItem("AWAVE", "A trous Wavelets", "Layered wavelet sharpening/denoise controls.", "Sharpening"),
-    LibraryItem("RWAVE", "RegiStax Wavelets", "RegiStax-style detail enhancement.", "Sharpening"),
-    LibraryItem("UMASK", "Unsharp Mask", "Classic local contrast/sharpening.", "Sharpening"),
-    LibraryItem("GBLUR", "Gaussian Blur", "Gaussian smoothing for noise reduction.", "Noise / smoothing"),
-    LibraryItem("BILAT", "Bilateral Filter", "Edge-preserving smoothing.", "Noise / smoothing"),
-    LibraryItem("NOISE", "Denoise", "General luminance/chroma noise cleanup.", "Noise / smoothing"),
-    LibraryItem("WHBAL", "White Balance", "Temperature/tint balancing.", "Color"),
-    LibraryItem("SATUR", "Saturation", "Global saturation and vibrance.", "Color"),
-    LibraryItem("CURVE", "Curves", "Tone remapping with curve points.", "Color"),
-    LibraryItem("CONTR", "Contrast", "Global and midtone contrast.", "Color"),
-    LibraryItem("ALIGN", "Channel Align", "Align channels/geometry correction.", "Geometry"),
-    LibraryItem("DERIN", "Deringing", "Suppress ringing artifacts.", "Geometry"),
-    LibraryItem("SELCO", "Selective Color", "Mask-like targeted color edits.", "Masking / selection"),
-]
+class History:
+    def __init__(self) -> None:
+        self._undo: list[Command] = []
+        self._redo: list[Command] = []
 
+    def execute(self, command: Command) -> None:
+        command.do()
+        self._undo.append(command)
+        self._redo.clear()
 
-class CollapsibleSection(ttk.Frame):
-    def __init__(self, parent: tk.Widget, title: str):
-        super().__init__(parent)
-        self._visible = tk.BooleanVar(value=True)
-        self._button = ttk.Checkbutton(self, text=title, variable=self._visible, command=self._toggle, style="Toolbutton")
-        self._button.pack(fill="x")
-        self.body = ttk.Frame(self)
-        self.body.pack(fill="x", padx=4, pady=(0, 4))
+    def undo(self) -> bool:
+        if not self._undo:
+            return False
+        command = self._undo.pop()
+        command.undo()
+        self._redo.append(command)
+        return True
 
-    def _toggle(self) -> None:
-        if self._visible.get():
-            self.body.pack(fill="x", padx=4, pady=(0, 4))
-        else:
-            self.body.pack_forget()
+    def redo(self) -> bool:
+        if not self._redo:
+            return False
+        command = self._redo.pop()
+        command.do()
+        self._undo.append(command)
+        return True
+
+    def clear(self) -> None:
+        self._undo.clear()
+        self._redo.clear()
 
 
 class PlanetSharpApp:
@@ -63,485 +62,554 @@ class PlanetSharpApp:
         self.root = tk.Tk()
         self.root.title("PlanetSharp v1")
         self.root.geometry("1400x900")
+
         self.status = tk.StringVar(value="Ready")
-        self.library_filter = tk.StringVar()
-        self.active_image = tk.StringVar(value="R")
-        self.viewer_mode = tk.StringVar(value="Before/After")
+        self.viewer_mode = tk.StringVar(value="Before")
         self.live_preview = tk.BooleanVar(value=True)
-        self.lock_roi = tk.BooleanVar(value=False)
-        self.drag_library_code: str | None = None
+        self.selected_stage = tk.IntVar(value=1)
+
+        self.loaded_image: dict[str, Any] | None = None
+        self.loaded_image_path: str | None = None
+        self.current_project_path: str | None = None
+        self.stage_cache: dict[str, dict[str, Any] | None] = {"stage1": None, "stage2": None, "full": None}
+
+        self.history = History()
         self.selected_block_id: str | None = None
-        self.param_clipboard: dict[str, Any] = {}
-        self.block_favorites: set[str] = set()
-        self.param_widgets: dict[str, tuple[tk.Variable, ttk.Scale]] = {}
-        self._last_log_id = 0
+
         self._build_layout()
         self._bind_shortcuts()
         self._restore_ui_state()
-        self._populate_library()
-        self._seed_images_and_pipeline()
-        self._refresh_pipeline()
+        self._seed_pipeline()
+        self._refresh_pipeline_views()
+        self._refresh_viewer_mode_options()
+        self._refresh_viewer()
+
+    def _seed_pipeline(self) -> None:
+        if not self.session.stage2_blocks:
+            for code in ("DECON", "SATUR", "CURVE"):
+                self.session.stage2_blocks.append(BlockInstance(type=code, params=dict(BLOCK_DEFINITIONS[code].defaults)))
 
     def _build_layout(self) -> None:
         self._build_toolbar()
-        self.main_panes = ttk.Panedwindow(self.root, orient="horizontal")
-        self.main_panes.pack(fill="both", expand=True)
+        self.main = ttk.Panedwindow(self.root, orient="horizontal")
+        self.main.pack(fill="both", expand=True)
 
-        self.left_panel = ttk.Frame(self.main_panes)
-        self.center_panel = ttk.Frame(self.main_panes)
-        self.right_panel = ttk.Frame(self.main_panes)
+        left = ttk.Frame(self.main)
+        center = ttk.Frame(self.main)
+        right = ttk.Frame(self.main)
+        self.main.add(left, weight=2)
+        self.main.add(center, weight=6)
+        self.main.add(right, weight=3)
 
-        self.main_panes.add(self.left_panel, weight=2)
-        self.main_panes.add(self.center_panel, weight=6)
-        self.main_panes.add(self.right_panel, weight=3)
-
-        self._build_left_toolbox()
-        self._build_center_workspace()
-        self._build_inspector()
+        self._build_library(left)
+        self._build_center(center)
+        self._build_inspector(right)
 
     def _build_toolbar(self) -> None:
         bar = ttk.Frame(self.root)
         bar.pack(fill="x", padx=6, pady=4)
         for label, cmd in [
-            ("Open", self._not_implemented),
-            ("Save", self._save_ui_state),
-            ("Export", self._not_implemented),
-            ("Undo", self._not_implemented),
-            ("Redo", self._not_implemented),
-            ("Run pipeline", self._simulate_render),
+            ("Open", self._open_image),
+            ("Save", self._save_project),
+            ("Export", self._export_image),
+            ("Undo", self._undo),
+            ("Redo", self._redo),
+            ("Run stage 1", self._run_stage1),
+            ("Run stage 2", self._run_stage2),
+            ("Run pipeline", self._run_pipeline),
         ]:
             ttk.Button(bar, text=label, command=cmd).pack(side="left", padx=2)
-        ttk.Checkbutton(bar, text="Live Preview", variable=self.live_preview).pack(side="left", padx=10)
+        ttk.Checkbutton(bar, text="Live Preview", variable=self.live_preview).pack(side="left", padx=8)
         ttk.Label(bar, textvariable=self.status).pack(side="right")
 
-    def _build_left_toolbox(self) -> None:
-        nb = ttk.Notebook(self.left_panel)
-        nb.pack(fill="both", expand=True)
-        library = ttk.Frame(nb)
-        presets = ttk.Frame(nb)
-        history = ttk.Frame(nb)
-        nb.add(library, text="Library")
-        nb.add(presets, text="Presets")
-        nb.add(history, text="History")
+    def _build_library(self, parent: ttk.Frame) -> None:
+        ttk.Label(parent, text="Building Blocks Library").pack(anchor="w", padx=4, pady=4)
+        self.library = tk.Listbox(parent, exportselection=False)
+        self.library.pack(fill="both", expand=True, padx=4, pady=4)
+        for code in sorted(BLOCK_DEFINITIONS):
+            self.library.insert("end", code)
+        ttk.Button(parent, text="Add to selected stage", command=self._add_library_block).pack(fill="x", padx=4, pady=4)
 
-        ttk.Entry(library, textvariable=self.library_filter).pack(fill="x", padx=4, pady=4)
-        self.library_filter.trace_add("write", lambda *_: self._populate_library())
-        self.library_tree = ttk.Treeview(library, show="tree", selectmode="browse")
-        self.library_tree.pack(fill="both", expand=True, padx=4, pady=4)
-        self.library_tree.bind("<<TreeviewSelect>>", self._select_library_item)
-        self.library_tree.bind("<Double-1>", lambda *_: self._add_selected_library_block())
-        self.library_tree.bind("<ButtonPress-1>", self._start_library_drag)
+    def _build_center(self, parent: ttk.Frame) -> None:
+        viewer = ttk.LabelFrame(parent, text="Viewer")
+        viewer.pack(fill="both", expand=True, padx=4, pady=4)
+        row = ttk.Frame(viewer)
+        row.pack(fill="x", padx=4, pady=4)
+        ttk.Label(row, text="Mode").pack(side="left")
+        self.viewer_combo = ttk.Combobox(row, textvariable=self.viewer_mode, state="readonly", width=20)
+        self.viewer_combo.pack(side="left", padx=4)
+        self.viewer_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_viewer())
+        ttk.Button(row, text="Fit", command=self._fit_viewer).pack(side="left", padx=4)
 
-        ttk.Label(presets, text="Saved pipeline presets").pack(anchor="w", padx=4, pady=(4, 0))
-        self.preset_list = tk.Listbox(presets, height=8)
-        self.preset_list.pack(fill="both", expand=True, padx=4, pady=4)
-        ttk.Button(presets, text="Save current as preset", command=self._save_pipeline_preset).pack(fill="x", padx=4)
-        ttk.Button(presets, text="Load selected preset", command=self._load_pipeline_preset).pack(fill="x", padx=4, pady=(4, 8))
+        self.viewer_canvas = tk.Canvas(viewer, background="#111", height=380)
+        self.viewer_canvas.pack(fill="both", expand=True, padx=4, pady=4)
 
-        ttk.Label(history, text="Undo/redo stack + snapshots").pack(anchor="w", padx=4, pady=4)
-        self.history_list = tk.Listbox(history)
-        self.history_list.pack(fill="both", expand=True, padx=4, pady=4)
-        ttk.Button(history, text="Add snapshot", command=self._snapshot).pack(fill="x", padx=4, pady=(0, 8))
+        pipeline = ttk.LabelFrame(parent, text="Pipeline Canvas")
+        pipeline.pack(fill="both", expand=True, padx=4, pady=4)
 
-    def _build_center_workspace(self) -> None:
-        center = ttk.Panedwindow(self.center_panel, orient="vertical")
-        center.pack(fill="both", expand=True)
+        s1_header = ttk.Label(pipeline, text="Stage 1 — Preprocessing", font=("TkDefaultFont", 10, "bold"))
+        s1_header.pack(fill="x", padx=4, pady=(4, 2))
+        self.stage1_tree = self._make_stage_tree(pipeline)
 
-        viewer = ttk.LabelFrame(center, text="Viewer")
-        pipeline = ttk.LabelFrame(center, text="Pipeline Canvas")
-        filmstrip = ttk.LabelFrame(center, text="Filmstrip")
-        center.add(viewer, weight=6)
-        center.add(pipeline, weight=3)
-        center.add(filmstrip, weight=1)
+        divider = ttk.Separator(pipeline, orient="horizontal")
+        divider.pack(fill="x", padx=4, pady=8)
 
-        controls = ttk.Frame(viewer)
+        s2_header = ttk.Label(pipeline, text="Stage 2 — Enhancement", font=("TkDefaultFont", 10, "bold"))
+        s2_header.pack(fill="x", padx=4, pady=(2, 2))
+        self.stage2_tree = self._make_stage_tree(pipeline)
+
+        for tree, stage in ((self.stage1_tree, 1), (self.stage2_tree, 2)):
+            tree.bind("<<TreeviewSelect>>", lambda _e, s=stage: self._on_select(s))
+            tree.bind("<Button-3>", lambda e, s=stage: self._show_context_menu(e, s))
+
+        controls = ttk.Frame(pipeline)
         controls.pack(fill="x", padx=4, pady=4)
-        ttk.OptionMenu(controls, self.viewer_mode, self.viewer_mode.get(), "Before/After", "Split", "Blink (A/B)").pack(side="left")
-        for zoom in ["Fit", "100%", "200%", "1:1"]:
-            ttk.Button(controls, text=zoom, command=lambda z=zoom: self._set_zoom(z)).pack(side="left", padx=2)
-        ttk.Checkbutton(controls, text="Lock ROI", variable=self.lock_roi).pack(side="left", padx=8)
-        ttk.Button(controls, text="Toggle overlays", command=self._not_implemented).pack(side="left", padx=2)
-
-        self.viewer_canvas = tk.Canvas(viewer, background="#0d0d10", height=360)
-        self.viewer_canvas.pack(fill="both", expand=True, padx=4)
-        self.viewer_canvas.create_text(420, 180, fill="white", text="Before / After / Split / Blink preview")
-        self.viewer_canvas.create_rectangle(230, 120, 610, 260, outline="#6bc1ff", width=2)
-
-        status = ttk.Frame(viewer)
-        status.pack(fill="x", padx=4, pady=4)
-        self.viewer_status = tk.StringVar(value="Zoom 100% | 16-bit | RGB | x:0 y:0 | pixel:0.000")
-        ttk.Label(status, textvariable=self.viewer_status).pack(anchor="w")
-
-        self.pipeline_tree = ttk.Treeview(pipeline, columns=("enabled", "name"), show="headings", selectmode="browse")
-        self.pipeline_tree.heading("enabled", text="On")
-        self.pipeline_tree.heading("name", text="Block")
-        self.pipeline_tree.column("enabled", width=40, anchor="center")
-        self.pipeline_tree.column("name", width=300, anchor="w")
-        self.pipeline_tree.pack(fill="both", expand=True, padx=4, pady=4)
-        self.pipeline_tree.bind("<<TreeviewSelect>>", self._on_pipeline_select)
-
-        row = ttk.Frame(pipeline)
-        row.pack(fill="x", padx=4, pady=(0, 4))
         for label, cmd in [
             ("▲", self._move_up),
             ("▼", self._move_down),
             ("Enable/Disable", self._toggle_enabled),
             ("Duplicate", self._duplicate_selected),
             ("Delete", self._delete_selected),
-            ("Apply", self._simulate_render),
-            ("Drop from Library", self._add_selected_library_block),
+            ("Apply", self._run_pipeline),
         ]:
-            ttk.Button(row, text=label, command=cmd).pack(side="left", padx=2)
+            ttk.Button(controls, text=label, command=cmd).pack(side="left", padx=2)
 
-        apply_opts = ttk.Frame(pipeline)
-        apply_opts.pack(fill="x", padx=4, pady=(0, 4))
-        self.apply_mode = tk.StringVar(value="Live preview")
-        for mode in ["Live preview", "Manual apply", "Apply after 250ms idle"]:
-            ttk.Radiobutton(apply_opts, text=mode, variable=self.apply_mode, value=mode).pack(side="left", padx=4)
+    def _make_stage_tree(self, parent: ttk.Widget) -> ttk.Treeview:
+        tree = ttk.Treeview(parent, columns=("enabled", "name"), show="headings", selectmode="browse", height=6)
+        tree.heading("enabled", text="On")
+        tree.heading("name", text="Block")
+        tree.column("enabled", width=45, anchor="center")
+        tree.column("name", width=300, anchor="w")
+        tree.pack(fill="x", padx=4)
+        return tree
 
-        self.filmstrip_list = tk.Listbox(filmstrip, exportselection=False, height=3)
-        self.filmstrip_list.pack(fill="both", expand=True, padx=4, pady=4)
-        self.filmstrip_list.bind("<<ListboxSelect>>", self._set_active_image_from_filmstrip)
-        ttk.Button(filmstrip, text="Sync pipeline to selected images", command=self._sync_selected_images).pack(side="left", padx=4, pady=(0, 4))
-        ttk.Button(filmstrip, text="Sync selected block only", command=self._sync_selected_block).pack(side="left", padx=4, pady=(0, 4))
-
-    def _build_inspector(self) -> None:
-        tools = ttk.Frame(self.right_panel)
-        tools.pack(fill="x", padx=4, pady=(4, 0))
-        ttk.Button(tools, text="Hide", command=lambda: self.main_panes.forget(self.right_panel)).pack(side="left")
-        ttk.Button(tools, text="Show", command=self._show_right_panel).pack(side="left", padx=4)
-
-        self.inspector_scroll = ttk.Frame(self.right_panel)
-        self.inspector_scroll.pack(fill="both", expand=True, padx=4, pady=4)
-
-        self.block_section = CollapsibleSection(self.inspector_scroll, "Block parameters")
-        self.block_section.pack(fill="x")
-        self.block_search = tk.StringVar()
-        ttk.Entry(self.block_section.body, textvariable=self.block_search).pack(fill="x", pady=(0, 4))
-        self.block_search.trace_add("write", lambda *_: self._render_param_editor())
-        ttk.Frame(self.block_section.body).pack(fill="x")
-        toolbar = ttk.Frame(self.block_section.body)
-        toolbar.pack(fill="x", pady=(0, 4))
-        ttk.Button(toolbar, text="Defaults", command=self._reset_selected_params).pack(side="left")
-        ttk.Button(toolbar, text="Recommended", command=self._recommended_params).pack(side="left", padx=2)
-        ttk.Button(toolbar, text="Copy", command=self._copy_params).pack(side="left", padx=2)
-        ttk.Button(toolbar, text="Paste", command=self._paste_params).pack(side="left", padx=2)
-        self.param_area = ttk.Frame(self.block_section.body)
-        self.param_area.pack(fill="x")
-
-        hist = CollapsibleSection(self.inspector_scroll, "Histogram / Waveform")
-        hist.pack(fill="x")
-        ttk.Label(hist.body, text="Histogram source: ROI if enabled").pack(anchor="w")
-
-        roi = CollapsibleSection(self.inspector_scroll, "ROI tools")
-        roi.pack(fill="x")
-        self.roi_text = tk.StringVar(value="Rect: x=230 y=120 w=380 h=140")
-        ttk.Label(roi.body, textvariable=self.roi_text).pack(anchor="w")
-        ttk.Checkbutton(roi.body, text="Use ROI for histogram", variable=tk.BooleanVar(value=True)).pack(anchor="w")
-
-        perf = CollapsibleSection(self.inspector_scroll, "Performance + queue")
-        perf.pack(fill="x")
-        self.progress = tk.IntVar(value=0)
-        ttk.Progressbar(perf.body, mode="determinate", maximum=100, variable=self.progress).pack(fill="x")
-        self.perf_text = tk.StringVar(value="Idle | CPU 0% | GPU N/A | Cache: warm")
-        ttk.Label(perf.body, textvariable=self.perf_text).pack(anchor="w")
-
-        log = CollapsibleSection(self.inspector_scroll, "Log / status")
-        log.pack(fill="both", expand=True)
-        self.log_box = tk.Text(log.body, height=10)
-        self.log_box.pack(fill="both", expand=True)
-        actions = ttk.Frame(log.body)
-        actions.pack(fill="x")
-        ttk.Button(actions, text="Copy log", command=self._copy_log).pack(side="left")
-        ttk.Button(actions, text="Clear log", command=lambda: self.log_box.delete("1.0", "end")).pack(side="left", padx=4)
+    def _build_inspector(self, parent: ttk.Frame) -> None:
+        inspector = ttk.LabelFrame(parent, text="Block parameters")
+        inspector.pack(fill="both", expand=True, padx=4, pady=4)
+        self.param_area = ttk.Frame(inspector)
+        self.param_area.pack(fill="both", expand=True, padx=4, pady=4)
 
     def _bind_shortcuts(self) -> None:
-        self.root.bind("<Control-z>", lambda *_: self._log("Undo requested"))
-        self.root.bind("<Control-y>", lambda *_: self._log("Redo requested"))
-        self.root.bind("<space>", lambda *_: self.status.set("Pan mode (hold space)"))
-        self.root.bind("<Control-MouseWheel>", lambda e: self._set_zoom("200%" if e.delta > 0 else "100%"))
-        self.root.bind("b", lambda *_: self._toggle_before_after())
-        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.bind("<Control-z>", lambda *_: self._undo())
+        self.root.bind("<Control-y>", lambda *_: self._redo())
 
-    def _seed_images_and_pipeline(self) -> None:
-        channels = ["L", "R", "G", "B", "CH4"]
-        for channel in channels:
-            self.filmstrip_list.insert("end", f"{channel}  • mapped")
-        if not self.session.stage2_workflow.blocks:
-            for code in ("DECON", "SATUR", "CURVE"):
-                self.session.stage2_workflow.blocks.append(BlockInstance(type=code, params=dict(BLOCK_DEFINITIONS[code].defaults)))
+    def _active_stage_blocks(self) -> list[BlockInstance]:
+        return self.session.stage1_blocks if self.selected_stage.get() == 1 else self.session.stage2_blocks
 
-    def _pipeline(self) -> list[BlockInstance]:
-        return self.session.stage2_workflow.blocks
+    def _refresh_pipeline_views(self) -> None:
+        for tree, blocks in ((self.stage1_tree, self.session.stage1_blocks), (self.stage2_tree, self.session.stage2_blocks)):
+            tree.delete(*tree.get_children())
+            for block in blocks:
+                tree.insert("", "end", iid=block.id, values=("☑" if block.enabled else "☐", block.type))
 
-    def _populate_library(self) -> None:
-        self.library_tree.delete(*self.library_tree.get_children())
-        needle = self.library_filter.get().strip().lower()
-        by_cat: dict[str, list[LibraryItem]] = defaultdict(list)
-        for item in BLOCK_LIBRARY:
-            if needle and needle not in f"{item.name} {item.code} {item.description}".lower():
-                continue
-            by_cat[item.category].append(item)
-        for category in ("Sharpening", "Noise / smoothing", "Color", "Geometry", "Masking / selection"):
-            parent = self.library_tree.insert("", "end", text=category, open=True)
-            for item in by_cat.get(category, []):
-                star = "⭐" if item.code in self.block_favorites else "☆"
-                self.library_tree.insert(parent, "end", iid=f"lib:{item.code}", text=f"{star} {item.name} ({item.code})", values=())
-
-    def _select_library_item(self, _event: Any) -> None:
-        sel = self.library_tree.selection()
-        if not sel:
-            return
-        item_id = sel[0]
-        if item_id.startswith("lib:"):
-            code = item_id.split(":", 1)[1]
-            desc = next((x.description for x in BLOCK_LIBRARY if x.code == code), "")
-            self.status.set(desc)
-
-    def _start_library_drag(self, event: tk.Event) -> None:
-        row = self.library_tree.identify_row(event.y)
-        if row.startswith("lib:"):
-            self.drag_library_code = row.split(":", 1)[1]
-
-    def _add_selected_library_block(self) -> None:
-        sel = self.library_tree.selection()
-        code = None
-        if sel and sel[0].startswith("lib:"):
-            code = sel[0].split(":", 1)[1]
-        elif self.drag_library_code:
-            code = self.drag_library_code
-        if not code:
-            return
-        self._pipeline().append(BlockInstance(type=code, params=dict(BLOCK_DEFINITIONS[code].defaults)))
-        self._refresh_pipeline()
-        self._log(f"Added block {code} by drag/drop")
-
-    def _refresh_pipeline(self) -> None:
-        self.pipeline_tree.delete(*self.pipeline_tree.get_children())
-        for block in self._pipeline():
-            on = "☑" if block.enabled else "☐"
-            self.pipeline_tree.insert("", "end", iid=block.id, values=(on, block.type))
-        if self._pipeline() and self.selected_block_id not in {b.id for b in self._pipeline()}:
-            self.selected_block_id = self._pipeline()[0].id
+        available_ids = {b.id for b in (self.session.stage1_blocks + self.session.stage2_blocks)}
+        if self.selected_block_id not in available_ids:
+            self.selected_block_id = None
         if self.selected_block_id:
-            self.pipeline_tree.selection_set(self.selected_block_id)
-            self._on_pipeline_select(None)
+            for tree in (self.stage1_tree, self.stage2_tree):
+                if self.selected_block_id in tree.get_children():
+                    tree.selection_set(self.selected_block_id)
 
-    def _on_pipeline_select(self, _event: Any) -> None:
-        sel = self.pipeline_tree.selection()
+        self._render_param_editor()
+
+    def _on_select(self, stage: int) -> None:
+        tree = self.stage1_tree if stage == 1 else self.stage2_tree
+        sel = tree.selection()
         if not sel:
             return
+        self.selected_stage.set(stage)
+        self.session.selected_stage = stage
         self.selected_block_id = sel[0]
+        other = self.stage2_tree if stage == 1 else self.stage1_tree
+        other.selection_remove(other.selection())
         self._render_param_editor()
 
     def _selected_block(self) -> BlockInstance | None:
-        return next((b for b in self._pipeline() if b.id == self.selected_block_id), None)
+        for block in self.session.stage1_blocks + self.session.stage2_blocks:
+            if block.id == self.selected_block_id:
+                return block
+        return None
 
     def _render_param_editor(self) -> None:
         for child in self.param_area.winfo_children():
             child.destroy()
-        self.param_widgets.clear()
         block = self._selected_block()
         if not block:
+            ttk.Label(self.param_area, text="Select a block.").pack(anchor="w")
             return
-        q = self.block_search.get().strip().lower()
-        for name, value in block.params.items():
-            if q and q not in name.lower():
-                continue
-            if isinstance(value, (int, float)):
+        ttk.Label(self.param_area, text=f"{block.type}", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 4))
+
+        for key, value in block.params.items():
+            if isinstance(value, bool):
+                var = tk.BooleanVar(value=value)
+                ttk.Checkbutton(self.param_area, text=key, variable=var, command=lambda k=key, v=var: self._set_param(k, v.get())).pack(anchor="w")
+            elif isinstance(value, (int, float)):
                 row = ttk.Frame(self.param_area)
                 row.pack(fill="x", pady=2)
-                ttk.Label(row, text=name, width=18).pack(side="left")
+                ttk.Label(row, text=key, width=18).pack(side="left")
                 var = tk.DoubleVar(value=float(value))
-                scale = ttk.Scale(row, from_=0.0, to=max(2.0, float(value) * 2 + 1), variable=var, command=lambda _v, n=name, v=var: self._set_param(n, v.get()))
+                scale = ttk.Scale(row, from_=0, to=max(2.0, float(value) * 2 + 1), variable=var, command=lambda _v, k=key, v=var: self._set_param(k, v.get()))
                 scale.pack(side="left", fill="x", expand=True, padx=4)
-                entry = ttk.Entry(row, width=8)
-                entry.pack(side="left")
-                entry.insert(0, f"{value:.3f}" if isinstance(value, float) else str(value))
-                entry.bind("<Return>", lambda e, n=name, ent=entry: self._entry_set_param(n, ent.get()))
-                ttk.Button(row, text="↺", width=2, command=lambda n=name: self._reset_param(n)).pack(side="left", padx=2)
-                self.param_widgets[name] = (var, scale)
-            elif isinstance(value, bool):
-                var = tk.BooleanVar(value=value)
-                ttk.Checkbutton(self.param_area, text=name, variable=var, command=lambda n=name, v=var: self._set_param(n, v.get())).pack(anchor="w")
 
-    def _set_param(self, name: str, value: Any) -> None:
+    def _set_param(self, key: str, value: Any) -> None:
         block = self._selected_block()
         if not block:
             return
-        block.params[name] = round(float(value), 4) if isinstance(value, (float, int)) else value
-        if self.apply_mode.get() == "Live preview" and self.live_preview.get():
-            self._simulate_render()
-
-    def _entry_set_param(self, name: str, raw: str) -> None:
-        try:
-            value = float(raw)
-        except ValueError:
+        old = block.params.get(key)
+        new = round(float(value), 4) if isinstance(value, (float, int)) else value
+        if old == new:
             return
-        self._set_param(name, value)
-        self._render_param_editor()
 
-    def _reset_param(self, name: str) -> None:
-        block = self._selected_block()
-        if not block:
-            return
-        block.params[name] = BLOCK_DEFINITIONS[block.type].defaults.get(name, block.params[name])
-        self._render_param_editor()
-
-    def _reset_selected_params(self) -> None:
-        block = self._selected_block()
-        if block:
-            block.params = dict(BLOCK_DEFINITIONS[block.type].defaults)
+        def do() -> None:
+            block.params[key] = new
+            self._invalidate_cache()
             self._render_param_editor()
+            self._auto_preview()
 
-    def _recommended_params(self) -> None:
-        block = self._selected_block()
-        if not block:
+        def undo() -> None:
+            block.params[key] = old
+            self._invalidate_cache()
+            self._render_param_editor()
+            self._auto_preview()
+
+        self.history.execute(Command(do=do, undo=undo, description=f"Param {key}"))
+
+    def _add_library_block(self) -> None:
+        sel = self.library.curselection()
+        if not sel:
             return
-        for k, v in block.params.items():
-            if isinstance(v, (int, float)):
-                block.params[k] = round(v * 1.1, 4)
-        self._render_param_editor()
+        code = self.library.get(sel[0])
+        blocks = self._active_stage_blocks()
+        block = BlockInstance(type=code, params=dict(BLOCK_DEFINITIONS[code].defaults))
 
-    def _copy_params(self) -> None:
-        block = self._selected_block()
-        if block:
-            self.param_clipboard = {"type": block.type, "params": dict(block.params)}
-            self._log(f"Copied parameters from {block.type}")
+        def do() -> None:
+            blocks.append(block)
+            self.selected_block_id = block.id
+            self._invalidate_cache()
+            self._refresh_pipeline_views()
 
-    def _paste_params(self) -> None:
-        block = self._selected_block()
-        if not block or self.param_clipboard.get("type") != block.type:
-            self._log("Paste failed: select same block type")
-            return
-        block.params = dict(self.param_clipboard["params"])
-        self._render_param_editor()
-        self._simulate_render()
+        def undo() -> None:
+            blocks.remove(block)
+            self.selected_block_id = None
+            self._invalidate_cache()
+            self._refresh_pipeline_views()
+
+        self.history.execute(Command(do=do, undo=undo, description="Add block"))
 
     def _toggle_enabled(self) -> None:
         block = self._selected_block()
-        if block:
-            block.enabled = not block.enabled
-            self._refresh_pipeline()
-            self._simulate_render()
+        if not block:
+            return
+        old = block.enabled
+
+        def do() -> None:
+            block.enabled = not old
+            self._invalidate_cache()
+            self._refresh_pipeline_views()
+            self._auto_preview()
+
+        def undo() -> None:
+            block.enabled = old
+            self._invalidate_cache()
+            self._refresh_pipeline_views()
+            self._auto_preview()
+
+        self.history.execute(Command(do=do, undo=undo, description="Toggle"))
 
     def _move_up(self) -> None:
-        block = self._selected_block()
-        if not block:
-            return
-        pipe = self._pipeline()
-        i = pipe.index(block)
-        if i > 0:
-            pipe[i - 1], pipe[i] = pipe[i], pipe[i - 1]
-            self._refresh_pipeline()
-            self._simulate_render()
+        self._move_selected(-1)
 
     def _move_down(self) -> None:
+        self._move_selected(1)
+
+    def _move_selected(self, delta: int) -> None:
+        blocks = self._active_stage_blocks()
         block = self._selected_block()
-        if not block:
+        if not block or block not in blocks:
             return
-        pipe = self._pipeline()
-        i = pipe.index(block)
-        if i < len(pipe) - 1:
-            pipe[i + 1], pipe[i] = pipe[i], pipe[i + 1]
-            self._refresh_pipeline()
-            self._simulate_render()
+        src = blocks.index(block)
+        dst = src + delta
+        if dst < 0 or dst >= len(blocks):
+            return
+
+        def do() -> None:
+            blocks[src], blocks[dst] = blocks[dst], blocks[src]
+            self._invalidate_cache()
+            self._refresh_pipeline_views()
+            self._auto_preview()
+
+        def undo() -> None:
+            blocks[src], blocks[dst] = blocks[dst], blocks[src]
+            self._invalidate_cache()
+            self._refresh_pipeline_views()
+            self._auto_preview()
+
+        self.history.execute(Command(do=do, undo=undo, description="Reorder"))
 
     def _duplicate_selected(self) -> None:
         block = self._selected_block()
-        if block:
-            self._pipeline().append(BlockInstance(type=block.type, params=dict(block.params), enabled=block.enabled))
-            self._refresh_pipeline()
+        if not block:
+            return
+        blocks = self._active_stage_blocks()
+        clone = BlockInstance(type=block.type, enabled=block.enabled, params=copy.deepcopy(block.params))
+
+        def do() -> None:
+            blocks.append(clone)
+            self.selected_block_id = clone.id
+            self._invalidate_cache()
+            self._refresh_pipeline_views()
+
+        def undo() -> None:
+            blocks.remove(clone)
+            self.selected_block_id = block.id
+            self._invalidate_cache()
+            self._refresh_pipeline_views()
+
+        self.history.execute(Command(do=do, undo=undo, description="Duplicate"))
 
     def _delete_selected(self) -> None:
         block = self._selected_block()
-        if block:
-            self._pipeline().remove(block)
+        if not block:
+            return
+        blocks = self.session.stage1_blocks if block in self.session.stage1_blocks else self.session.stage2_blocks
+        idx = blocks.index(block)
+
+        def do() -> None:
+            blocks.remove(block)
             self.selected_block_id = None
-            self._refresh_pipeline()
+            self._invalidate_cache()
+            self._refresh_pipeline_views()
 
-    def _save_pipeline_preset(self) -> None:
-        name = simpledialog.askstring("Save preset", "Preset name:", parent=self.root)
-        if not name:
+        def undo() -> None:
+            blocks.insert(idx, block)
+            self.selected_block_id = block.id
+            self._invalidate_cache()
+            self._refresh_pipeline_views()
+
+        self.history.execute(Command(do=do, undo=undo, description="Delete"))
+
+    def _show_context_menu(self, event: tk.Event, stage: int) -> None:
+        tree = self.stage1_tree if stage == 1 else self.stage2_tree
+        row = tree.identify_row(event.y)
+        if not row:
             return
-        notes = simpledialog.askstring("Save preset", "Notes (optional):", parent=self.root) or ""
-        preset = {
-            "name": name,
-            "notes": notes,
-            "blocks": [{"type": b.type, "enabled": b.enabled, "params": b.params} for b in self._pipeline()],
-        }
-        self.preset_list.insert("end", json.dumps(preset))
+        tree.selection_set(row)
+        self._on_select(stage)
+        menu = tk.Menu(self.root, tearoff=0)
+        menu.add_command(label="Move to stage 1", command=lambda: self._move_block_to_stage(1))
+        menu.add_command(label="Move to stage 2", command=lambda: self._move_block_to_stage(2))
+        menu.tk_popup(event.x_root, event.y_root)
 
-    def _load_pipeline_preset(self) -> None:
-        sel = self.preset_list.curselection()
-        if not sel:
-            return
-        preset = json.loads(self.preset_list.get(sel[0]))
-        self.session.stage2_workflow.blocks = [
-            BlockInstance(type=b["type"], enabled=b["enabled"], params=b["params"]) for b in preset["blocks"]
-        ]
-        self._refresh_pipeline()
-
-    def _snapshot(self) -> None:
-        self.history_list.insert("end", f"Snapshot {self.history_list.size() + 1}: {len(self._pipeline())} blocks")
-
-    def _simulate_render(self) -> None:
-        self.progress.set(0)
-        self.perf_text.set("Running pipeline | CPU 52% | GPU N/A | Cache: preview")
-        self.root.update_idletasks()
-        for pct in (15, 35, 65, 100):
-            self.progress.set(pct)
-            self.root.update_idletasks()
-        self.perf_text.set("Idle | CPU 0% | GPU N/A | Cache: warm")
-        self._log(f"Render complete: {[b.type for b in self._pipeline() if b.enabled]}")
-
-    def _set_zoom(self, zoom: str) -> None:
-        self.viewer_status.set(f"Zoom {zoom} | 16-bit | RGB | x:128 y:72 | pixel:0.553")
-
-    def _toggle_before_after(self) -> None:
-        self.viewer_mode.set("Split" if self.viewer_mode.get() == "Before/After" else "Before/After")
-
-    def _set_active_image_from_filmstrip(self, _event: Any) -> None:
-        sel = self.filmstrip_list.curselection()
-        if sel:
-            img = self.filmstrip_list.get(sel[0]).split()[0]
-            self.active_image.set(img)
-            self.status.set(f"Active image: {img}")
-
-    def _sync_selected_images(self) -> None:
-        sel = self.filmstrip_list.curselection()
-        names = [self.filmstrip_list.get(i).split()[0] for i in sel]
-        self._log(f"Sync edits applied to: {', '.join(names) if names else 'none'}")
-
-    def _sync_selected_block(self) -> None:
+    def _move_block_to_stage(self, target_stage: int) -> None:
         block = self._selected_block()
-        if block:
-            self._log(f"Synced block {block.type} to selected images")
+        if not block:
+            return
+        src_blocks = self.session.stage1_blocks if block in self.session.stage1_blocks else self.session.stage2_blocks
+        dst_blocks = self.session.stage1_blocks if target_stage == 1 else self.session.stage2_blocks
+        if src_blocks is dst_blocks:
+            return
+        src_idx = src_blocks.index(block)
 
-    def _copy_log(self) -> None:
-        text = self.log_box.get("1.0", "end").strip()
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
+        def do() -> None:
+            src_blocks.remove(block)
+            dst_blocks.append(block)
+            self.selected_stage.set(target_stage)
+            self.selected_block_id = block.id
+            self._invalidate_cache()
+            self._refresh_pipeline_views()
 
-    def _log(self, message: str) -> None:
-        self._last_log_id += 1
-        stamp = time.strftime("%H:%M:%S")
-        self.log_box.insert("end", f"[{stamp}] #{self._last_log_id:03d} {message}\n")
-        self.log_box.see("end")
+        def undo() -> None:
+            dst_blocks.remove(block)
+            src_blocks.insert(src_idx, block)
+            self.selected_stage.set(1 if src_blocks is self.session.stage1_blocks else 2)
+            self.selected_block_id = block.id
+            self._invalidate_cache()
+            self._refresh_pipeline_views()
 
-    def _show_right_panel(self) -> None:
-        if self.right_panel not in self.main_panes.panes():
-            self.main_panes.add(self.right_panel, weight=3)
+        self.history.execute(Command(do=do, undo=undo, description="Move stage"))
+
+    def _run_blocks(self, blocks: list[BlockInstance], input_image: dict[str, Any], stage_name: str) -> dict[str, Any]:
+        signal = sum((idx + 1) * 0.01 for idx, b in enumerate(blocks) if b.enabled)
+        output = dict(input_image)
+        output["signal"] = round(signal, 4)
+        output["stage"] = stage_name
+        output["blocks"] = [b.type for b in blocks if b.enabled]
+        return output
+
+    def _run_stage1(self) -> None:
+        if not self.loaded_image:
+            return
+        self.stage_cache["stage1"] = self._run_blocks(self.session.stage1_blocks, self.loaded_image, "stage1")
+        self.stage_cache["full"] = None
+        self._refresh_viewer_mode_options()
+        self.status.set("Stage 1 complete")
+        self._refresh_viewer()
+
+    def _run_stage2(self) -> None:
+        if not self.loaded_image:
+            return
+        stage2_input = self.stage_cache["stage1"] or self.loaded_image
+        self.stage_cache["stage2"] = self._run_blocks(self.session.stage2_blocks, stage2_input, "stage2")
+        self.stage_cache["full"] = self.stage_cache["stage2"]
+        self._refresh_viewer_mode_options()
+        self.status.set("Stage 2 complete")
+        self._refresh_viewer()
+
+    def _run_pipeline(self) -> None:
+        if not self.loaded_image:
+            return
+        self._run_stage1()
+        self._run_stage2()
+        self.status.set("Pipeline complete")
+
+    def _source_for_mode(self, mode: str) -> dict[str, Any] | None:
+        if mode == "Before":
+            return self.loaded_image
+        if mode == "Stage 1 output":
+            return self.stage_cache["stage1"]
+        if mode == "Stage 2 output":
+            return self.stage_cache["stage2"]
+        if mode == "Full pipeline":
+            return self.stage_cache["full"]
+        return self.loaded_image
+
+    def _fit_viewer(self) -> None:
+        self.session.viewer_state.zoom = 1.0
+        self.status.set("Viewer fit")
+        self._refresh_viewer()
+
+    def _refresh_viewer(self) -> None:
+        self.viewer_canvas.delete("all")
+        source = self._source_for_mode(self.viewer_mode.get())
+        if not source:
+            self.viewer_canvas.create_text(420, 180, fill="white", text="No image loaded")
+            return
+        label = Path(source.get("path", "")).name or "image"
+        mode = self.viewer_mode.get()
+        self.viewer_canvas.create_rectangle(80, 50, 760, 320, outline="#6bc1ff", width=2)
+        self.viewer_canvas.create_text(420, 140, fill="white", text=f"{label}")
+        self.viewer_canvas.create_text(420, 180, fill="#90ee90", text=f"Mode: {mode}")
+        self.viewer_canvas.create_text(420, 220, fill="#cccccc", text=f"Signal: {source.get('signal', 0.0)}")
+        self.viewer_canvas.update_idletasks()
+
+    def _refresh_viewer_mode_options(self) -> None:
+        modes = ["Before"]
+        if self.stage_cache["stage1"] is not None:
+            modes.append("Stage 1 output")
+        if self.stage_cache["stage2"] is not None:
+            modes.append("Stage 2 output")
+        if self.stage_cache["full"] is not None:
+            modes.append("Full pipeline")
+        modes.extend(["Split", "Blink"])
+        self.viewer_combo["values"] = modes
+        if self.viewer_mode.get() not in modes:
+            self.viewer_mode.set("Before")
+
+    def _invalidate_cache(self) -> None:
+        self.stage_cache = {"stage1": None, "stage2": None, "full": None}
+        self._refresh_viewer_mode_options()
+
+    def _auto_preview(self) -> None:
+        if self.live_preview.get() and self.loaded_image:
+            self._run_pipeline()
+
+    def _open_image(self) -> None:
+        path = filedialog.askopenfilename(
+            title="Open image",
+            filetypes=[("Image", "*.png *.bmp *.tif *.tiff *.jpg *.jpeg *.xisf *.fits")],
+        )
+        if not path:
+            return
+        try:
+            image = read_image(path)
+        except ValueError as exc:
+            messagebox.showerror("PlanetSharp", str(exc))
+            return
+
+        self.loaded_image = image
+        self.loaded_image_path = path
+        self._invalidate_cache()
+        self.viewer_mode.set("Before")
+        self._fit_viewer()
+        self.status.set(f"Loaded {Path(path).name}")
+
+        if self.live_preview.get():
+            self._run_pipeline()
+        else:
+            self._refresh_viewer()
+
+        self.history.clear()
+
+    def _save_project(self) -> None:
+        path = self.current_project_path
+        if not path:
+            path = filedialog.asksaveasfilename(
+                title="Save project",
+                defaultextension=PROJECT_SUFFIX,
+                filetypes=[("PlanetSharp Project", f"*{PROJECT_SUFFIX}")],
+            )
+        if not path:
+            return
+        self.current_project_path = path
+
+        self.session.stage1_blocks = self.session.stage1_blocks
+        self.session.stage2_blocks = self.session.stage2_blocks
+        self.session.stage2_workflow.blocks = list(self.session.stage2_blocks)
+        self.session.viewer_state.stage_display = self.viewer_mode.get()
+        self.session.viewer_state.zoom = 1.0
+        if self.loaded_image_path:
+            self.session.inputs = [InputImage(path=self.loaded_image_path, role=Role.FILTER)]
+
+        SessionStore.save(path, self.session)
+        self.status.set(f"Saved project: {Path(path).name}")
+
+    def _export_image(self) -> None:
+        if not self.loaded_image:
+            return
+        target = simpledialog.askstring("Export", "Target (stage1/stage2/full):", initialvalue="full", parent=self.root)
+        if not target:
+            return
+        target = target.lower().strip()
+
+        if target == "stage1" and self.stage_cache["stage1"] is None:
+            self._run_stage1()
+        elif target in {"stage2", "full"} and self.stage_cache["stage2"] is None:
+            self._run_pipeline()
+
+        source = {
+            "stage1": self.stage_cache["stage1"],
+            "stage2": self.stage_cache["stage2"],
+            "full": self.stage_cache["full"],
+        }.get(target)
+        if source is None:
+            messagebox.showerror("PlanetSharp", "Requested output unavailable")
+            return
+
+        path = filedialog.asksaveasfilename(
+            title="Export image",
+            defaultextension=".png",
+            filetypes=[("PNG", "*.png"), ("TIFF", "*.tiff"), ("JPG", "*.jpg")],
+        )
+        if not path:
+            return
+        write_image(path, source, bit_depth=16)
+        self.status.set(f"Exported {Path(path).name}")
+
+    def _undo(self) -> None:
+        if self.history.undo():
+            self.status.set("Undo")
+            self._refresh_pipeline_views()
+            self._refresh_viewer()
+
+    def _redo(self) -> None:
+        if self.history.redo():
+            self.status.set("Redo")
+            self._refresh_pipeline_views()
+            self._refresh_viewer()
 
     def _save_ui_state(self) -> None:
-        state = {
-            "viewer_mode": self.viewer_mode.get(),
-            "live_preview": self.live_preview.get(),
-            "lock_roi": self.lock_roi.get(),
-            "geometry": self.root.geometry(),
-        }
+        state = {"viewer_mode": self.viewer_mode.get(), "geometry": self.root.geometry()}
         LAYOUT_STATE.write_text(json.dumps(state, indent=2), encoding="utf-8")
-        self.status.set("Layout saved")
 
     def _restore_ui_state(self) -> None:
         if not LAYOUT_STATE.exists():
@@ -550,20 +618,16 @@ class PlanetSharpApp:
             state = json.loads(LAYOUT_STATE.read_text(encoding="utf-8"))
         except json.JSONDecodeError:
             return
-        self.viewer_mode.set(state.get("viewer_mode", self.viewer_mode.get()))
-        self.live_preview.set(state.get("live_preview", self.live_preview.get()))
-        self.lock_roi.set(state.get("lock_roi", self.lock_roi.get()))
+        self.viewer_mode.set(state.get("viewer_mode", "Before"))
         if geometry := state.get("geometry"):
             self.root.geometry(geometry)
-
-    def _not_implemented(self) -> None:
-        messagebox.showinfo("PlanetSharp", "This action is a placeholder in v1 prototype.")
 
     def _on_close(self) -> None:
         self._save_ui_state()
         self.root.destroy()
 
     def run(self) -> None:
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.mainloop()
 
 

@@ -20,12 +20,15 @@ class SessionTests(unittest.TestCase):
 
     def test_save_reload_roundtrip(self):
         session = Session()
-        session.stage2_workflow.blocks.append(BlockInstance(type="SATUR", params={"global_saturation": 1.2}))
+        session.stage1_blocks.append(BlockInstance(type="NOISE", params={"strength": 0.2}))
+        session.stage2_blocks.append(BlockInstance(type="SATUR", params={"global_saturation": 1.2}))
         with tempfile.NamedTemporaryFile(suffix=".planetflow.json") as f:
             SessionStore.save(f.name, session)
             loaded = SessionStore.load(f.name)
-        self.assertEqual(len(loaded.stage2_workflow.blocks), 1)
-        self.assertEqual(loaded.stage2_workflow.blocks[0].type, "SATUR")
+        self.assertEqual(len(loaded.stage1_blocks), 1)
+        self.assertEqual(loaded.stage1_blocks[0].type, "NOISE")
+        self.assertEqual(len(loaded.stage2_blocks), 1)
+        self.assertEqual(loaded.stage2_blocks[0].type, "SATUR")
 
     def test_deterministic_render_signal(self):
         session = Session()
