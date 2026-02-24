@@ -6,6 +6,7 @@ from planetsharp.core.presets import DEFAULT_FILTER_PRESETS
 from planetsharp.persistence.session_store import SessionStore
 from planetsharp.persistence.template_store import TemplateStore
 from planetsharp.processing.engine import WorkflowEngine
+from planetsharp.io.formats import detect_format
 
 
 class SessionTests(unittest.TestCase):
@@ -54,6 +55,21 @@ class SessionTests(unittest.TestCase):
         a = engine.render(session).final
         b = engine.render(session).final
         self.assertEqual(a, b)
+
+    def test_template_preserves_stage1_channel(self):
+        session = Session()
+        block = BlockInstance(type="NOISE", enabled=True, params={"strength": 0.4}, channel="R")
+        session.stage1_workflows["R"].blocks.append(block)
+        with tempfile.NamedTemporaryFile(suffix=".planetsharp-template.json") as f:
+            TemplateStore.save(f.name, session)
+            loaded = TemplateStore.load(f.name)
+        self.assertEqual(loaded["stage1"][0].channel, "R")
+
+    def test_jpg_disabled(self):
+        with self.assertRaises(ValueError):
+            detect_format("foo.jpg")
+        with self.assertRaises(ValueError):
+            detect_format("foo.jpeg")
 
 
 if __name__ == "__main__":

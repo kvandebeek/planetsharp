@@ -13,9 +13,12 @@ SCHEMA_VERSION = 1
 class TemplateStore:
     @staticmethod
     def save(path: str, session: Session) -> None:
+        stage1 = [TemplateStore._serialize_block(b) for ch in ("L", "R", "G", "B", "FILTER") for b in session.stage1_workflows[ch].blocks]
+        if not stage1 and session.stage1_blocks:
+            stage1 = [TemplateStore._serialize_block(b) for b in session.stage1_blocks]
         payload = {
             "schema_version": SCHEMA_VERSION,
-            "stage1": [TemplateStore._serialize_block(b) for b in session.stage1_blocks],
+            "stage1": stage1,
             "stage2": [TemplateStore._serialize_block(b) for b in session.stage2_blocks],
         }
         Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
@@ -37,6 +40,7 @@ class TemplateStore:
             "type": block.type,
             "enabled": block.enabled,
             "params": block.params,
+            "channel": block.channel,
             "metadata": {},
         }
 
@@ -46,6 +50,7 @@ class TemplateStore:
             "type": data["type"],
             "enabled": data.get("enabled", True),
             "params": data.get("params", {}),
+            "channel": data.get("channel"),
         }
         if data.get("id"):
             kwargs["id"] = data["id"]
