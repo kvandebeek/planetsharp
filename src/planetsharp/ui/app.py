@@ -99,6 +99,8 @@ class PlanetSharpApp:
         self._drag_from_library: str | None = None
         self._viewer_source_image: tk.PhotoImage | None = None
         self._viewer_display_image: tk.PhotoImage | None = None
+        self._viewer_processed_image: tk.PhotoImage | None = None
+        self._viewer_processed_signature: str | None = None
         self._cpu_history: list[float] = [0.0] * 20
         self._overlay_stipples = ("gray75", "gray50", "gray25", "gray12")
 
@@ -542,12 +544,14 @@ class PlanetSharpApp:
             upstream = dict(self.loaded_image)
             upstream["channels_signal"] = {"L": 0.0, "R": 0.0, "G": 0.0, "B": 0.0}
             upstream_key = hashlib.sha1((self.loaded_image.get("path", "") + str(self.loaded_image.get("format", ""))).encode()).hexdigest()
+            enabled_blocks = 0
             for idx, block in enumerate(self._pipeline_blocks()):
                 sig = signatures[idx]
                 key = hashlib.sha1(f"{upstream_key}|{sig}".encode()).hexdigest()
                 out = dict(upstream)
                 out["channels_signal"] = dict(upstream["channels_signal"])
                 if block.enabled:
+                    enabled_blocks += 1
                     bump = round((idx + 1) * 0.01 + self._param_signal(block.params), 4)
                     channel = block.channel or "L"
                     out["channels_signal"][channel] = round(out["channels_signal"].get(channel, 0.0) + bump, 4)
@@ -556,6 +560,7 @@ class PlanetSharpApp:
                 self._block_cache[key] = out
                 upstream = out
                 upstream_key = key
+            upstream["work_acc"] = self._simulate_work(enabled_blocks, upstream.get("signal", 0.0))
             if generation != self._generation:
                 return
             self._last_pipeline_sigs = signatures
@@ -579,6 +584,7 @@ class PlanetSharpApp:
 
     def _finish_processing(self, output: dict[str, Any]) -> None:
         self.processed_image = output
+        self._viewer_processed_image = self._build_processed_preview(output)
         self.status.set("Ready")
         self._refresh_viewer()
 
@@ -590,16 +596,61 @@ class PlanetSharpApp:
             self.viewer_canvas.create_text(w // 2, h // 2, fill="white", text="No image loaded")
             return
         source = self.processed_image or self.loaded_image
-        if not self._viewer_source_image:
+        image_to_show = self._viewer_processed_image if self.processed_image is not None else self._viewer_source_image
+        if not image_to_show:
             self.viewer_canvas.create_text(w // 2, h // 2, fill="white", text="Image unavailable")
             return
-        self._viewer_display_image = self._fit_photo(self._viewer_source_image, w - 16, h - 16)
+        self._viewer_display_image = self._fit_photo(image_to_show, w - 16, h - 16)
         self.viewer_canvas.create_image(w // 2, h // 2, image=self._viewer_display_image, anchor="center")
-        if self.processed_image is not None:
-            self._draw_processed_overlay(source, w, h)
         sig = source.get("channels_signal", {})
         overlay = f"signal {source.get('signal', 0.0)} | L:{sig.get('L',0)} R:{sig.get('R',0)} G:{sig.get('G',0)} B:{sig.get('B',0)}"
         self.viewer_canvas.create_text(8, 8, anchor="nw", fill="#90ee90", text=overlay)
+
+    @staticmethod
+    def _simulate_work(enabled_blocks: int, signal: float) -> float:
+        total_steps = max(80_000, enabled_blocks * 120_000)
+        acc = float(signal)
+        for index in range(total_steps):
+            acc += ((index % 91) - 45) * 0.00001
+            acc *= 0.999999
+        return round(acc, 6)
+
+    @staticmethod
+    def _channel_gains(source: dict[str, Any]) -> tuple[float, float, float]:
+        levels = PlanetSharpApp._overlay_levels(source)
+        l_boost = 1.0 + (levels["L"] * 0.25)
+        return (
+            l_boost * (1.0 + levels["R"] * 0.35),
+            l_boost * (1.0 + levels["G"] * 0.35),
+            l_boost * (1.0 + levels["B"] * 0.35),
+        )
+
+    @staticmethod
+    def _apply_channel_gains(rgb: tuple[int, int, int], gains: tuple[float, float, float]) -> tuple[int, int, int]:
+        return tuple(min(255, max(0, int(channel * gain))) for channel, gain in zip(rgb, gains))
+
+    def _build_processed_preview(self, source: dict[str, Any]) -> tk.PhotoImage | None:
+        if not self._viewer_source_image:
+            return None
+        signature = hashlib.sha1(json.dumps(source.get("channels_signal", {}), sort_keys=True).encode()).hexdigest()
+        if self._viewer_processed_signature == signature and self._viewer_processed_image is not None:
+            return self._viewer_processed_image
+        gains = self._channel_gains(source)
+        width = self._viewer_source_image.width()
+        height = self._viewer_source_image.height()
+        transformed = tk.PhotoImage(width=width, height=height)
+        for y in range(height):
+            row: list[str] = []
+            for x in range(width):
+                rgb = self._viewer_source_image.get(x, y)
+                if isinstance(rgb, str):
+                    rgb = self.root.winfo_rgb(rgb)
+                    rgb = (rgb[0] // 256, rgb[1] // 256, rgb[2] // 256)
+                r, g, b = self._apply_channel_gains(rgb, gains)
+                row.append(f"#{r:02x}{g:02x}{b:02x}")
+            transformed.put("{" + " ".join(row) + "}", to=(0, y))
+        self._viewer_processed_signature = signature
+        return transformed
 
     @staticmethod
     def _overlay_levels(source: dict[str, Any]) -> dict[str, float]:
@@ -674,6 +725,8 @@ class PlanetSharpApp:
             return
         self.loaded_image = loaded
         self._viewer_source_image = preview
+        self._viewer_processed_image = None
+        self._viewer_processed_signature = None
         self.loaded_image_path = path
         self.processed_image = None
         self.status.set(f"Loaded {Path(path).name}")

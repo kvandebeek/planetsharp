@@ -102,5 +102,14 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(levels["B"], 1.0)
 
 
+    def test_channel_gains_increase_with_signal(self):
+        gains = PlanetSharpApp._channel_gains({"channels_signal": {"L": 0.1, "R": 0.2, "G": 0.0, "B": 0.0}})
+        self.assertGreater(gains[0], gains[1])
+        self.assertGreater(gains[0], 1.0)
+
+    def test_apply_channel_gains_clamps_channels(self):
+        adjusted = PlanetSharpApp._apply_channel_gains((240, 120, 10), (2.0, 1.5, 0.5))
+        self.assertEqual(adjusted, (255, 180, 5))
+
 if __name__ == "__main__":
     unittest.main()
