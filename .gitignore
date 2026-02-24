@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+
+# Compiled/binary artifacts
+*.so
+*.dylib
+*.dll
+*.pyd
+*.exe
+*.bin
