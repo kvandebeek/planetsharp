@@ -65,11 +65,9 @@ class SessionTests(unittest.TestCase):
             loaded = TemplateStore.load(f.name)
         self.assertEqual(loaded["stage1"][0].channel, "R")
 
-    def test_jpg_disabled(self):
-        with self.assertRaises(ValueError):
-            detect_format("foo.jpg")
-        with self.assertRaises(ValueError):
-            detect_format("foo.jpeg")
+    def test_jpg_format_supported(self):
+        self.assertEqual(detect_format("foo.jpg"), ".jpg")
+        self.assertEqual(detect_format("foo.jpeg"), ".jpeg")
 
 
 if __name__ == "__main__":

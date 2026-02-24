@@ -604,7 +604,7 @@ class PlanetSharpApp:
     def _open_any(self) -> None:
         path = filedialog.askopenfilename(
             title="Open image or template",
-            filetypes=[("Image/Template", f"*.png *.bmp *.tif *.tiff *.xisf *.fits *{TEMPLATE_SUFFIX}"), ("Template", f"*{TEMPLATE_SUFFIX}")],
+            filetypes=[("Image/Template", f"*.png *.bmp *.tif *.tiff *.jpg *.jpeg *.xisf *.fits *{TEMPLATE_SUFFIX}"), ("Template", f"*{TEMPLATE_SUFFIX}")],
         )
         if not path:
             return
@@ -669,7 +669,7 @@ class PlanetSharpApp:
         if source is None:
             messagebox.showerror("PlanetSharp", "No image loaded")
             return
-        path = filedialog.asksaveasfilename(title="Export image", defaultextension=".png", filetypes=[("PNG", "*.png"), ("TIFF", "*.tiff")])
+        path = filedialog.asksaveasfilename(title="Export image", defaultextension=".png", filetypes=[("PNG", "*.png"), ("BMP", "*.bmp"), ("TIFF", "*.tif *.tiff"), ("JPEG", "*.jpg *.jpeg"), ("XISF", "*.xisf"), ("FITS", "*.fits")])
         if path:
             write_image(path, source, bit_depth=16)
             self.status.set(f"Exported {Path(path).name} ({self.viewer_mode.get()})")
