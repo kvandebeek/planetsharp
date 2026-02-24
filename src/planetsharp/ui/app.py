@@ -4,6 +4,7 @@ import copy
 import hashlib
 import json
 import math
+import os
 import threading
 import tkinter as tk
 from dataclasses import dataclass
@@ -17,6 +18,26 @@ from planetsharp.persistence.template_store import TEMPLATE_SUFFIX, TemplateStor
 from planetsharp.processing.blocks import BLOCK_DEFINITIONS
 
 LAYOUT_STATE = Path.home() / ".planetsharp.layout.json"
+STAGE1_CHANNELS = ("L", "R", "G", "B", "FILTER")
+BLOCK_COLORS = {
+    "DECON": "#a264ff",
+    "AWAVE": "#a264ff",
+    "RWAVE": "#a264ff",
+    "UMASK": "#a264ff",
+    "DERIN": "#a264ff",
+    "COBAL": "#3f8efc",
+    "WHBAL": "#3f8efc",
+    "SELCO": "#3f8efc",
+    "SATUR": "#3f8efc",
+    "ALIGN": "#1abc9c",
+    "GBLUR": "#f39c12",
+    "BILAT": "#f39c12",
+    "NOISE": "#f39c12",
+    "LINST": "#27ae60",
+    "LEVEL": "#27ae60",
+    "CURVE": "#27ae60",
+    "CONTR": "#27ae60",
+}
 
 
 @dataclass
@@ -52,10 +73,6 @@ class History:
         self._undo.append(command)
         return True
 
-    def clear(self) -> None:
-        self._undo.clear()
-        self._redo.clear()
-
 
 class PlanetSharpApp:
     def __init__(self, session: Session | None = None):
@@ -67,6 +84,7 @@ class PlanetSharpApp:
         self.status = tk.StringVar(value="Ready")
         self.viewer_mode = tk.StringVar(value="Before")
         self.selected_stage = tk.IntVar(value=1)
+        self.selected_channel = tk.StringVar(value="L")
 
         self.loaded_image: dict[str, Any] | None = None
         self.loaded_image_path: str | None = None
@@ -80,12 +98,9 @@ class PlanetSharpApp:
         self._generation = 0
         self._processing_thread: threading.Thread | None = None
         self._drag_from_library: str | None = None
-        self._drag_block_id: str | None = None
-        self._drag_source_stage: int | None = None
-        self._drag_insert_row: str | None = None
-        self._drag_insert_after = False
         self._viewer_source_image: tk.PhotoImage | None = None
         self._viewer_display_image: tk.PhotoImage | None = None
+        self._cpu_history: list[float] = [0.0] * 20
 
         self._build_layout()
         self._bind_shortcuts()
@@ -93,6 +108,7 @@ class PlanetSharpApp:
         self._seed_pipeline()
         self._refresh_pipeline_views()
         self._refresh_viewer()
+        self._tick_cpu_usage()
 
     def _seed_pipeline(self) -> None:
         if not self.session.stage2_blocks:
@@ -100,6 +116,8 @@ class PlanetSharpApp:
                 self.session.stage2_blocks.append(BlockInstance(type=code, params=dict(BLOCK_DEFINITIONS[code].defaults)))
 
     def _build_layout(self) -> None:
+        ttk.Style().configure("Treeview", rowheight=28)
+
         bar = ttk.Frame(self.root)
         bar.pack(fill="x", padx=6, pady=4)
         for label, cmd in [
@@ -110,6 +128,9 @@ class PlanetSharpApp:
             ("Redo", self._redo),
         ]:
             ttk.Button(bar, text=label, command=cmd).pack(side="left", padx=2)
+        ttk.Label(bar, text="CPU (20s)").pack(side="left", padx=(12, 4))
+        self.cpu_canvas = tk.Canvas(bar, width=180, height=40, background="#111", highlightthickness=1, highlightbackground="#444")
+        self.cpu_canvas.pack(side="left")
         ttk.Label(bar, textvariable=self.status).pack(side="right")
 
         self.main = ttk.Panedwindow(self.root, orient="vertical")
@@ -139,7 +160,7 @@ class PlanetSharpApp:
         center = ttk.LabelFrame(workflow, text="Pipeline Canvas")
         right = ttk.LabelFrame(workflow, text="Block Parameters")
         workflow.add(left, weight=2)
-        workflow.add(center, weight=4)
+        workflow.add(center, weight=6)
         workflow.add(right, weight=2)
 
         self.library = tk.Listbox(left, exportselection=False)
@@ -149,24 +170,29 @@ class PlanetSharpApp:
             self.library.insert("end", f"{name} ({code})")
         self.library.bind("<ButtonPress-1>", self._start_library_drag)
 
-        ttk.Label(center, text="Stage 1 — Preprocessing", font=("TkDefaultFont", 10, "bold")).pack(fill="x", padx=4, pady=(4, 2))
-        self.stage1_frame = tk.Frame(center, highlightthickness=2, highlightbackground="#555")
-        self.stage1_frame.pack(fill="both", expand=True, padx=4)
-        self.stage1_tree = self._make_stage_tree(self.stage1_frame)
+        ttk.Label(center, text="Stage 1 — Preprocessing (L/R/G/B/Filter)", font=("TkDefaultFont", 10, "bold")).pack(fill="x", padx=4, pady=(4, 2))
+        stage1_grid = ttk.Frame(center)
+        stage1_grid.pack(fill="both", expand=True, padx=4)
+        self.stage1_trees: dict[str, ttk.Treeview] = {}
+        for idx, ch in enumerate(STAGE1_CHANNELS):
+            pane = tk.Frame(stage1_grid, highlightthickness=2, highlightbackground="#555")
+            pane.grid(row=0, column=idx, sticky="nsew", padx=2)
+            stage1_grid.grid_columnconfigure(idx, weight=1)
+            ttk.Label(pane, text=ch, font=("TkDefaultFont", 9, "bold")).pack(fill="x")
+            tree = self._make_stage_tree(pane)
+            self.stage1_trees[ch] = tree
+            tree.bind("<<TreeviewSelect>>", lambda _e, c=ch: self._on_select_stage1(c))
+            tree.bind("<B1-Motion>", self._drag_motion)
+            tree.bind("<ButtonRelease-1>", self._drop_on_tree)
 
         ttk.Separator(center, orient="horizontal").pack(fill="x", padx=4, pady=8)
         ttk.Label(center, text="Stage 2 — Enhancement", font=("TkDefaultFont", 10, "bold")).pack(fill="x", padx=4, pady=(2, 2))
         self.stage2_frame = tk.Frame(center, highlightthickness=2, highlightbackground="#555")
         self.stage2_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
         self.stage2_tree = self._make_stage_tree(self.stage2_frame)
-        self.stage1_tree.tag_configure("insert_marker", background="#264f78")
-        self.stage2_tree.tag_configure("insert_marker", background="#264f78")
-
-        for tree, stage in ((self.stage1_tree, 1), (self.stage2_tree, 2)):
-            tree.bind("<<TreeviewSelect>>", lambda _e, s=stage: self._on_select(s))
-            tree.bind("<ButtonPress-1>", lambda e, s=stage: self._start_tree_drag(e, s))
-            tree.bind("<B1-Motion>", self._drag_motion)
-            tree.bind("<ButtonRelease-1>", self._drop_on_tree)
+        self.stage2_tree.bind("<<TreeviewSelect>>", lambda _e: self._on_select(2))
+        self.stage2_tree.bind("<B1-Motion>", self._drag_motion)
+        self.stage2_tree.bind("<ButtonRelease-1>", self._drop_on_tree)
 
         controls = ttk.Frame(center)
         controls.pack(fill="x", padx=4, pady=4)
@@ -177,37 +203,60 @@ class PlanetSharpApp:
         self.param_area.pack(fill="both", expand=True, padx=4, pady=4)
 
     def _make_stage_tree(self, parent: tk.Widget) -> ttk.Treeview:
-        tree = ttk.Treeview(parent, columns=("enabled", "name"), show="headings", selectmode="browse", height=6)
-        tree.heading("enabled", text="Enabled")
+        tree = ttk.Treeview(parent, columns=("name",), show="headings", selectmode="browse", height=6)
         tree.heading("name", text="Block")
-        tree.column("enabled", width=80, anchor="center")
-        tree.column("name", width=320, anchor="w")
-        tree.pack(fill="both", expand=True, padx=4, pady=2)
+        tree.column("name", width=180, anchor="w")
+        tree.pack(fill="both", expand=True, padx=2, pady=2)
         return tree
 
     def _bind_shortcuts(self) -> None:
         self.root.bind("<Control-z>", lambda *_: self._undo())
         self.root.bind("<Control-y>", lambda *_: self._redo())
 
+    def _stage1_blocks(self, channel: str) -> list[BlockInstance]:
+        return self.session.stage1_workflows[channel].blocks
+
     def _pipeline_blocks(self) -> list[BlockInstance]:
-        return self.session.stage1_blocks + self.session.stage2_blocks
+        blocks: list[BlockInstance] = []
+        for ch in STAGE1_CHANNELS:
+            for b in self._stage1_blocks(ch):
+                b.channel = ch
+                blocks.append(b)
+        blocks.extend(self.session.stage2_blocks)
+        return blocks
 
     def _refresh_pipeline_views(self) -> None:
-        for tree, blocks in ((self.stage1_tree, self.session.stage1_blocks), (self.stage2_tree, self.session.stage2_blocks)):
+        for ch, tree in self.stage1_trees.items():
             tree.delete(*tree.get_children())
-            for block in blocks:
+            for block in self._stage1_blocks(ch):
                 name = BLOCK_DEFINITIONS[block.type].display_name
-                tree.insert("", "end", iid=block.id, values=("☑" if block.enabled else "☐", f"{name} ({block.type})"))
+                tree.insert("", "end", iid=block.id, values=(f"{name} ({block.type})",), tags=(block.type,))
+        self.stage2_tree.delete(*self.stage2_tree.get_children())
+        for block in self.session.stage2_blocks:
+            name = BLOCK_DEFINITIONS[block.type].display_name
+            self.stage2_tree.insert("", "end", iid=block.id, values=(f"{name} ({block.type})",), tags=(block.type,))
+        for tree in [*self.stage1_trees.values(), self.stage2_tree]:
+            for code, color in BLOCK_COLORS.items():
+                tree.tag_configure(code, background=color)
+        self._render_param_editor()
+
+    def _on_select_stage1(self, channel: str) -> None:
+        sel = self.stage1_trees[channel].selection()
+        if not sel:
+            return
+        self.selected_stage.set(1)
+        self.selected_channel.set(channel)
+        self.selected_block_id = sel[0]
         self._render_param_editor()
 
     def _on_select(self, stage: int) -> None:
-        tree = self.stage1_tree if stage == 1 else self.stage2_tree
-        sel = tree.selection()
-        if not sel:
-            return
-        self.selected_stage.set(stage)
-        self.selected_block_id = sel[0]
-        self._render_param_editor()
+        if stage == 2:
+            sel = self.stage2_tree.selection()
+            if not sel:
+                return
+            self.selected_stage.set(2)
+            self.selected_block_id = sel[0]
+            self._render_param_editor()
 
     def _selected_block(self) -> BlockInstance | None:
         for block in self._pipeline_blocks():
@@ -222,21 +271,22 @@ class PlanetSharpApp:
         if not block:
             ttk.Label(self.param_area, text="Select a block.").pack(anchor="w")
             return
+        location = f"Stage 1 [{block.channel}]" if block.channel else "Stage 2"
         ttk.Label(self.param_area, text=f"{BLOCK_DEFINITIONS[block.type].display_name} ({block.type})", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 4))
+        ttk.Label(self.param_area, text=f"Location: {location}").pack(anchor="w", pady=(0, 6))
         for key, value in block.params.items():
             if isinstance(value, (int, float)):
                 row = ttk.Frame(self.param_area)
                 row.pack(fill="x", pady=2)
-                ttk.Label(row, text=key, width=18).pack(side="left")
+                ttk.Label(row, text=key, width=16).pack(side="left")
                 var = tk.DoubleVar(value=float(value))
                 scale = ttk.Scale(row, from_=0, to=max(2.0, float(value) * 2 + 1), variable=var, command=lambda _v, k=key, v=var: self._set_param(k, v.get()))
                 scale.pack(side="left", fill="x", expand=True, padx=4)
 
     def _active_stage_blocks(self) -> list[BlockInstance] | None:
-        stage = self.selected_stage.get()
-        if stage == 1:
-            return self.session.stage1_blocks
-        if stage == 2:
+        if self.selected_stage.get() == 1:
+            return self._stage1_blocks(self.selected_channel.get())
+        if self.selected_stage.get() == 2:
             return self.session.stage2_blocks
         return None
 
@@ -263,32 +313,7 @@ class PlanetSharpApp:
         sel = self.library.curselection()
         if not sel:
             return None
-        text = self.library.get(sel[0])
-        return text.rsplit("(", 1)[-1].rstrip(")")
-
-    def _add_library_block(self) -> None:
-        code = self._code_from_library_selection()
-        if not code:
-            return
-        blocks = self._active_stage_blocks()
-        if blocks is None:
-            messagebox.showinfo("PlanetSharp", "Select Stage 1 or Stage 2 before adding a block.")
-            return
-        block = BlockInstance(type=code, params=dict(BLOCK_DEFINITIONS[code].defaults))
-
-        def do() -> None:
-            blocks.append(block)
-            self.selected_block_id = block.id
-            self._refresh_pipeline_views()
-            self._schedule_processing("add")
-
-        def undo() -> None:
-            blocks.remove(block)
-            self.selected_block_id = None
-            self._refresh_pipeline_views()
-            self._schedule_processing("remove")
-
-        self.history.execute(Command(do=do, undo=undo, description="Add"))
+        return self.library.get(sel[0]).rsplit("(", 1)[-1].rstrip(")")
 
     def _toggle_enabled(self) -> None:
         block = self._selected_block()
@@ -301,12 +326,7 @@ class PlanetSharpApp:
             self._refresh_pipeline_views()
             self._schedule_processing("toggle")
 
-        def undo() -> None:
-            block.enabled = old
-            self._refresh_pipeline_views()
-            self._schedule_processing("toggle")
-
-        self.history.execute(Command(do=do, undo=undo, description="Toggle"))
+        self.history.execute(Command(do=do, undo=do, description="Toggle"))
 
     def _move_up(self) -> None:
         self._move_selected(-1)
@@ -336,7 +356,7 @@ class PlanetSharpApp:
         blocks = self._active_stage_blocks()
         if not block or blocks is None:
             return
-        clone = BlockInstance(type=block.type, enabled=block.enabled, params=copy.deepcopy(block.params))
+        clone = BlockInstance(type=block.type, enabled=block.enabled, params=copy.deepcopy(block.params), channel=block.channel)
 
         def do() -> None:
             blocks.append(clone)
@@ -355,7 +375,9 @@ class PlanetSharpApp:
         block = self._selected_block()
         if not block:
             return
-        blocks = self.session.stage1_blocks if block in self.session.stage1_blocks else self.session.stage2_blocks
+        blocks = self._active_stage_blocks()
+        if blocks is None or block not in blocks:
+            return
         idx = blocks.index(block)
 
         def do() -> None:
@@ -377,99 +399,49 @@ class PlanetSharpApp:
         if self._drag_from_library:
             self.root.configure(cursor="hand2")
 
-    def _start_tree_drag(self, event: tk.Event, stage: int) -> None:
-        tree = self.stage1_tree if stage == 1 else self.stage2_tree
-        row = tree.identify_row(event.y)
-        self._drag_block_id = row or None
-        self._drag_source_stage = stage if row else None
-        if row:
-            self.root.configure(cursor="fleur")
-
-    def _tree_under_pointer(self, x_root: int, y_root: int) -> tuple[ttk.Treeview | None, int | None]:
+    def _tree_under_pointer(self, x_root: int, y_root: int) -> tuple[ttk.Treeview | None, int | None, str | None]:
         widget = self.root.winfo_containing(x_root, y_root)
-        for tree, stage in ((self.stage1_tree, 1), (self.stage2_tree, 2)):
+        for ch, tree in self.stage1_trees.items():
             if widget is tree or (widget and str(widget).startswith(str(tree))):
-                return tree, stage
-        return None, None
-
-    def _clear_drag_visuals(self) -> None:
-        for frame in (self.stage1_frame, self.stage2_frame):
-            frame.configure(highlightbackground="#555")
-        for tree in (self.stage1_tree, self.stage2_tree):
-            for iid in tree.get_children():
-                tree.item(iid, tags=())
+                return tree, 1, ch
+        tree = self.stage2_tree
+        if widget is tree or (widget and str(widget).startswith(str(tree))):
+            return tree, 2, None
+        return None, None, None
 
     def _drag_motion(self, event: tk.Event) -> None:
-        if not (self._drag_from_library or self._drag_block_id):
+        if not self._drag_from_library:
             return
-        tree, stage = self._tree_under_pointer(event.x_root, event.y_root)
-        self._drag_insert_row = None
-        self._drag_insert_after = False
-        self._clear_drag_visuals()
-        if not tree or not stage:
-            return
-        (self.stage1_frame if stage == 1 else self.stage2_frame).configure(highlightbackground="#4a90e2")
-        y = event.y_root - tree.winfo_rooty()
-        row = tree.identify_row(y)
-        if not row:
-            return
-        self._drag_insert_row = row
-        bbox = tree.bbox(row)
-        if bbox:
-            self._drag_insert_after = y > (bbox[1] + bbox[3] / 2)
-        tree.item(row, tags=("insert_marker",))
+        tree, stage, _ch = self._tree_under_pointer(event.x_root, event.y_root)
+        for frame in [self.stage2_frame, *[t.master for t in self.stage1_trees.values()]]:
+            frame.configure(highlightbackground="#555")
+        if tree and stage:
+            tree.master.configure(highlightbackground="#4a90e2")
 
     def _drop_on_tree(self, event: tk.Event) -> None:
-        tree, stage = self._tree_under_pointer(event.x_root, event.y_root)
+        tree, stage, channel = self._tree_under_pointer(event.x_root, event.y_root)
         self.root.configure(cursor="")
+        for frame in [self.stage2_frame, *[t.master for t in self.stage1_trees.values()]]:
+            frame.configure(highlightbackground="#555")
+        if not self._drag_from_library:
+            return
         if not tree or not stage:
             self._drag_from_library = None
-            self._drag_block_id = None
-            self._drag_source_stage = None
-            self._clear_drag_visuals()
             return
-        target_blocks = self.session.stage1_blocks if stage == 1 else self.session.stage2_blocks
-        target_row = self._drag_insert_row
-        insert_index = len(target_blocks)
-        if target_row:
-            insert_index = target_blocks.index(next(b for b in target_blocks if b.id == target_row)) + (1 if self._drag_insert_after else 0)
-        if self._drag_from_library:
-            block = BlockInstance(type=self._drag_from_library, params=dict(BLOCK_DEFINITIONS[self._drag_from_library].defaults))
-            target_blocks.insert(insert_index, block)
-            self._drag_from_library = None
-            self.selected_stage.set(stage)
-            self.selected_block_id = block.id
-            self._refresh_pipeline_views()
-            self._schedule_processing("drag-insert")
-            self._clear_drag_visuals()
-            return
-        if not self._drag_block_id or not self._drag_source_stage:
-            self._clear_drag_visuals()
-            return
-        src_blocks = self.session.stage1_blocks if self._drag_source_stage == 1 else self.session.stage2_blocks
-        block = next((candidate for candidate in src_blocks if candidate.id == self._drag_block_id), None)
-        if block is None:
-            self._drag_block_id = None
-            self._drag_source_stage = None
-            self._clear_drag_visuals()
-            return
-
-        src_index = src_blocks.index(block)
-        src_blocks.remove(block)
-        if src_blocks is target_blocks and insert_index > src_index:
-            insert_index -= 1
-        target_blocks.insert(min(insert_index, len(target_blocks)), block)
-
+        block = BlockInstance(type=self._drag_from_library, params=dict(BLOCK_DEFINITIONS[self._drag_from_library].defaults), channel=channel)
+        if stage == 1 and channel:
+            self._stage1_blocks(channel).append(block)
+            self.selected_channel.set(channel)
+        else:
+            self.session.stage2_blocks.append(block)
         self.selected_stage.set(stage)
         self.selected_block_id = block.id
-        self._drag_block_id = None
-        self._drag_source_stage = None
-        self._clear_drag_visuals()
+        self._drag_from_library = None
         self._refresh_pipeline_views()
-        self._schedule_processing("drag-move")
+        self._schedule_processing("drag-insert")
 
     def _block_signature(self, block: BlockInstance) -> str:
-        payload = {"type": block.type, "enabled": block.enabled, "params": block.params}
+        payload = {"type": block.type, "enabled": block.enabled, "params": block.params, "channel": block.channel}
         return json.dumps(payload, sort_keys=True, default=str)
 
     def _schedule_processing(self, reason: str) -> None:
@@ -485,32 +457,22 @@ class PlanetSharpApp:
         self._generation += 1
         generation = self._generation
         signatures = [self._block_signature(b) for b in self._pipeline_blocks()]
-        start = 0
-        for idx, (old, new) in enumerate(zip(self._last_pipeline_sigs, signatures)):
-            if old != new:
-                start = idx
-                break
-            start = idx + 1
-        start = min(start, len(signatures))
         self.status.set(f"Processing… ({reason})")
-        print(f"[pipeline] recompute_start={start}")
 
         def worker() -> None:
-            upstream = self.loaded_image
+            upstream = dict(self.loaded_image)
+            upstream["channels_signal"] = {"L": 0.0, "R": 0.0, "G": 0.0, "B": 0.0, "FILTER": 0.0}
             upstream_key = hashlib.sha1((self.loaded_image.get("path", "") + str(self.loaded_image.get("format", ""))).encode()).hexdigest()
             for idx, block in enumerate(self._pipeline_blocks()):
                 sig = signatures[idx]
                 key = hashlib.sha1(f"{upstream_key}|{sig}".encode()).hexdigest()
-                if idx < start and key in self._block_cache:
-                    upstream = self._block_cache[key]
-                    upstream_key = key
-                    print(f"[pipeline] cache-hit idx={idx}")
-                    continue
-                print(f"[pipeline] cache-miss idx={idx}")
-                if generation != self._generation:
-                    return
                 out = dict(upstream)
-                out["signal"] = round(float(out.get("signal", 0.0)) + ((idx + 1) * 0.01 if block.enabled else 0.0), 4)
+                out["channels_signal"] = dict(upstream["channels_signal"])
+                if block.enabled:
+                    bump = round((idx + 1) * 0.01, 4)
+                    channel = block.channel or "FILTER"
+                    out["channels_signal"][channel] = round(out["channels_signal"].get(channel, 0.0) + bump, 4)
+                out["signal"] = round(sum(out["channels_signal"].values()), 4)
                 out["last_block"] = block.type
                 self._block_cache[key] = out
                 upstream = out
@@ -530,28 +492,28 @@ class PlanetSharpApp:
 
     def _refresh_viewer(self) -> None:
         self.viewer_canvas.delete("all")
-        canvas_w = max(self.viewer_canvas.winfo_width(), 1)
-        canvas_h = max(self.viewer_canvas.winfo_height(), 1)
+        w = max(self.viewer_canvas.winfo_width(), 1)
+        h = max(self.viewer_canvas.winfo_height(), 1)
         if not self.loaded_image:
-            self.viewer_canvas.create_text(canvas_w // 2, canvas_h // 2, fill="white", text="No image loaded")
+            self.viewer_canvas.create_text(w // 2, h // 2, fill="white", text="No image loaded")
             return
         source = self.loaded_image if self.viewer_mode.get() == "Before" else self.processed_image
         if source is None:
-            self.viewer_canvas.create_text(canvas_w // 2, canvas_h // 2, fill="white", text="Processing…")
+            self.viewer_canvas.create_text(w // 2, h // 2, fill="white", text="Processing…")
             return
         if not self._viewer_source_image:
-            self.viewer_canvas.create_text(canvas_w // 2, canvas_h // 2, fill="white", text="Image unavailable")
+            self.viewer_canvas.create_text(w // 2, h // 2, fill="white", text="Image unavailable")
             return
-        self._viewer_display_image = self._fit_photo(self._viewer_source_image, canvas_w - 16, canvas_h - 16)
-        self.viewer_canvas.create_image(canvas_w // 2, canvas_h // 2, image=self._viewer_display_image, anchor="center")
-        mode = self.viewer_mode.get()
-        signal = source.get("signal", 0.0)
-        self.viewer_canvas.create_text(8, 8, anchor="nw", fill="#90ee90", text=f"{mode} • signal {signal}")
+        self._viewer_display_image = self._fit_photo(self._viewer_source_image, w - 16, h - 16)
+        self.viewer_canvas.create_image(w // 2, h // 2, image=self._viewer_display_image, anchor="center")
+        sig = source.get("channels_signal", {})
+        overlay = f"signal {source.get('signal', 0.0)} | L:{sig.get('L',0)} R:{sig.get('R',0)} G:{sig.get('G',0)} B:{sig.get('B',0)}"
+        self.viewer_canvas.create_text(8, 8, anchor="nw", fill="#90ee90", text=overlay)
 
     def _open_any(self) -> None:
         path = filedialog.askopenfilename(
             title="Open image or template",
-            filetypes=[("Image/Template", f"*.png *.bmp *.tif *.tiff *.jpg *.jpeg *.xisf *.fits *{TEMPLATE_SUFFIX}"), ("Template", f"*{TEMPLATE_SUFFIX}")],
+            filetypes=[("Image/Template", f"*.png *.bmp *.tif *.tiff *.xisf *.fits *{TEMPLATE_SUFFIX}"), ("Template", f"*{TEMPLATE_SUFFIX}")],
         )
         if not path:
             return
@@ -584,11 +546,9 @@ class PlanetSharpApp:
         self._schedule_processing("image-load")
 
     def _fit_photo(self, image: tk.PhotoImage, max_w: int, max_h: int) -> tk.PhotoImage:
-        max_w = max(max_w, 1)
-        max_h = max(max_h, 1)
         if image.width() <= max_w and image.height() <= max_h:
             return image
-        factor = max(1, math.ceil(max(image.width() / max_w, image.height() / max_h)))
+        factor = max(1, math.ceil(max(image.width() / max(max_w, 1), image.height() / max(max_h, 1))))
         return image.subsample(factor, factor)
 
     def _open_template(self, path: str) -> None:
@@ -597,7 +557,11 @@ class PlanetSharpApp:
         except Exception as exc:
             messagebox.showerror("PlanetSharp", f"Template load failed: {exc}")
             return
-        self.session.stage1_blocks = loaded["stage1"]
+        for ch in STAGE1_CHANNELS:
+            self.session.stage1_workflows[ch].blocks.clear()
+        for block in loaded["stage1"]:
+            ch = block.channel if block.channel in STAGE1_CHANNELS else "L"
+            self.session.stage1_workflows[ch].blocks.append(block)
         self.session.stage2_blocks = loaded["stage2"]
         self.selected_block_id = None
         self._refresh_pipeline_views()
@@ -606,21 +570,18 @@ class PlanetSharpApp:
 
     def _save_template(self) -> None:
         path = filedialog.asksaveasfilename(title="Save template", defaultextension=TEMPLATE_SUFFIX, filetypes=[("PlanetSharp Template", f"*{TEMPLATE_SUFFIX}")])
-        if not path:
-            return
-        TemplateStore.save(path, self.session)
-        self.status.set(f"Saved template {Path(path).name}")
+        if path:
+            TemplateStore.save(path, self.session)
 
     def _export_image(self) -> None:
         source = self.loaded_image if self.viewer_mode.get() == "Before" else self.processed_image
         if source is None:
             messagebox.showerror("PlanetSharp", "No image loaded")
             return
-        path = filedialog.asksaveasfilename(title="Export image", defaultextension=".png", filetypes=[("PNG", "*.png"), ("TIFF", "*.tiff"), ("JPG", "*.jpg")])
-        if not path:
-            return
-        write_image(path, source, bit_depth=16)
-        self.status.set(f"Exported {Path(path).name} ({self.viewer_mode.get()})")
+        path = filedialog.asksaveasfilename(title="Export image", defaultextension=".png", filetypes=[("PNG", "*.png"), ("TIFF", "*.tiff")])
+        if path:
+            write_image(path, source, bit_depth=16)
+            self.status.set(f"Exported {Path(path).name} ({self.viewer_mode.get()})")
 
     def _undo(self) -> None:
         if self.history.undo():
@@ -632,20 +593,43 @@ class PlanetSharpApp:
             self._refresh_pipeline_views()
             self._schedule_processing("redo")
 
+    def _tick_cpu_usage(self) -> None:
+        cpu = self._cpu_percent()
+        self._cpu_history = (self._cpu_history + [cpu])[-20:]
+        self.cpu_canvas.delete("all")
+        w = int(self.cpu_canvas["width"])
+        h = int(self.cpu_canvas["height"])
+        points = []
+        for i, val in enumerate(self._cpu_history):
+            x = int(i * (w - 1) / 19)
+            y = int(h - (val / 100.0) * (h - 2) - 1)
+            points.extend([x, y])
+        if len(points) >= 4:
+            self.cpu_canvas.create_line(*points, fill="#4ade80", width=2)
+        self.cpu_canvas.create_text(4, 4, anchor="nw", fill="#ddd", text=f"{cpu:.1f}%")
+        self.root.after(1000, self._tick_cpu_usage)
+
+    def _cpu_percent(self) -> float:
+        try:
+            load = os.getloadavg()[0]
+            cores = max(1, os.cpu_count() or 1)
+            return max(0.0, min(100.0, (load / cores) * 100.0))
+        except (AttributeError, OSError):
+            return 0.0
+
     def _save_ui_state(self) -> None:
-        state = {"viewer_mode": self.viewer_mode.get(), "geometry": self.root.geometry()}
-        LAYOUT_STATE.write_text(json.dumps(state, indent=2), encoding="utf-8")
+        LAYOUT_STATE.write_text(json.dumps({"viewer_mode": self.viewer_mode.get(), "geometry": self.root.geometry()}, indent=2), encoding="utf-8")
 
     def _restore_ui_state(self) -> None:
         if not LAYOUT_STATE.exists():
             return
         try:
             state = json.loads(LAYOUT_STATE.read_text(encoding="utf-8"))
+            self.viewer_mode.set(state.get("viewer_mode", "Before"))
+            if geometry := state.get("geometry"):
+                self.root.geometry(geometry)
         except json.JSONDecodeError:
             return
-        self.viewer_mode.set(state.get("viewer_mode", "Before"))
-        if geometry := state.get("geometry"):
-            self.root.geometry(geometry)
 
     def _on_close(self) -> None:
         self._save_ui_state()

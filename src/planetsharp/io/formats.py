@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-SUPPORTED_FORMATS = {".png", ".bmp", ".tif", ".tiff", ".jpg", ".jpeg", ".xisf", ".fits"}
+SUPPORTED_FORMATS = {".png", ".bmp", ".tif", ".tiff", ".xisf", ".fits"}
 
 
 def detect_format(path: str) -> str:

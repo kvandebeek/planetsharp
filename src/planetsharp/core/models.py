@@ -86,6 +86,7 @@ class BlockInstance:
     type: str
     enabled: bool = True
     params: dict[str, Any] = field(default_factory=dict)
+    channel: str | None = None
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
 
 
@@ -102,7 +103,7 @@ class Session:
     inputs: list[InputImage] = field(default_factory=list)
     filter_mapping: FilterMapping = field(default_factory=FilterMapping)
     stage1_workflows: dict[str, Workflow] = field(
-        default_factory=lambda: {"L": Workflow(), "R": Workflow(), "G": Workflow(), "B": Workflow()}
+        default_factory=lambda: {"L": Workflow(), "R": Workflow(), "G": Workflow(), "B": Workflow(), "FILTER": Workflow()}
     )
     stage2_workflow: Workflow = field(default_factory=Workflow)
     mixer: MixerSettings = field(default_factory=MixerSettings)
@@ -132,7 +133,7 @@ class Session:
         )
 
         stage1 = {}
-        for key in ("L", "R", "G", "B"):
+        for key in ("L", "R", "G", "B", "FILTER"):
             blocks = [BlockInstance(**b) for b in data.get("stage1_workflows", {}).get(key, {}).get("blocks", [])]
             stage1[key] = Workflow(blocks=blocks)
 
@@ -140,6 +141,10 @@ class Session:
 
         stage1_blocks = [BlockInstance(**b) for b in data.get("stage1_blocks", [])]
         stage2_blocks = [BlockInstance(**b) for b in data.get("stage2_blocks", [])]
+        if stage1_blocks and not any(w.blocks for w in stage1.values()):
+            for block in stage1_blocks:
+                key = block.channel if block.channel in stage1 else "L"
+                stage1[key].blocks.append(block)
         if not stage1_blocks and not stage2_blocks:
             stage2_blocks = [BlockInstance(**b) for b in data.get("stage2_workflow", {}).get("blocks", [])]
 
