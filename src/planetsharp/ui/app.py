@@ -80,6 +80,7 @@ class PlanetSharpApp:
         self._processing_thread: threading.Thread | None = None
         self._drag_from_library: str | None = None
         self._drag_block_id: str | None = None
+        self._drag_source_stage: int | None = None
 
         self._build_layout()
         self._bind_shortcuts()
@@ -122,7 +123,6 @@ class PlanetSharpApp:
             name = BLOCK_DEFINITIONS[code].display_name
             self.library.insert("end", f"{name} ({code})")
         self.library.bind("<ButtonPress-1>", self._start_library_drag)
-        ttk.Button(left, text="Add to selected stage", command=self._add_library_block).pack(fill="x", padx=4, pady=4)
 
         viewer = ttk.LabelFrame(center, text="Viewer")
         viewer.pack(fill="both", expand=True, padx=4, pady=4)
@@ -362,6 +362,7 @@ class PlanetSharpApp:
         tree = self.stage1_tree if stage == 1 else self.stage2_tree
         row = tree.identify_row(event.y)
         self._drag_block_id = row or None
+        self._drag_source_stage = stage if row else None
 
     def _drop_on_tree(self, event: tk.Event, stage: int) -> None:
         tree = self.stage1_tree if stage == 1 else self.stage2_tree
@@ -377,20 +378,25 @@ class PlanetSharpApp:
             self._refresh_pipeline_views()
             self._schedule_processing("drag-insert")
             return
-        if not self._drag_block_id:
+        if not self._drag_block_id or not self._drag_source_stage:
             return
-        block = self._selected_block()
-        if not block:
+        src_blocks = self.session.stage1_blocks if self._drag_source_stage == 1 else self.session.stage2_blocks
+        block = next((candidate for candidate in src_blocks if candidate.id == self._drag_block_id), None)
+        if block is None:
+            self._drag_block_id = None
+            self._drag_source_stage = None
             return
-        src_blocks = self.session.stage1_blocks if block in self.session.stage1_blocks else self.session.stage2_blocks
-        if block in target_blocks:
-            src_blocks.remove(block)
-            target_blocks.insert(min(insert_index, len(target_blocks)), block)
-        else:
-            src_blocks.remove(block)
-            target_blocks.insert(insert_index, block)
+
+        src_index = src_blocks.index(block)
+        src_blocks.remove(block)
+        if src_blocks is target_blocks and insert_index > src_index:
+            insert_index -= 1
+        target_blocks.insert(min(insert_index, len(target_blocks)), block)
+
         self.selected_stage.set(stage)
+        self.selected_block_id = block.id
         self._drag_block_id = None
+        self._drag_source_stage = None
         self._refresh_pipeline_views()
         self._schedule_processing("drag-move")
 
