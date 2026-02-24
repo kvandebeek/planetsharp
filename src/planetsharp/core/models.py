@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any
 import uuid
 
+from planetsharp.processing.blocks import complete_block_params
+
 
 class Role(str, Enum):
     L = "L"
@@ -147,6 +149,16 @@ class Session:
                 stage1[key].blocks.append(block)
         if not stage1_blocks and not stage2_blocks:
             stage2_blocks = [BlockInstance(**b) for b in data.get("stage2_workflow", {}).get("blocks", [])]
+
+        for workflow in stage1.values():
+            for block in workflow.blocks:
+                block.params = complete_block_params(block.type, block.params)
+        for block in stage2.blocks:
+            block.params = complete_block_params(block.type, block.params)
+        for block in stage1_blocks:
+            block.params = complete_block_params(block.type, block.params)
+        for block in stage2_blocks:
+            block.params = complete_block_params(block.type, block.params)
 
         session = cls(
             inputs=[InputImage(path=i["path"], role=Role(i.get("role", "FILTER")), filter_name=i.get("filter_name", ""), assume_linear=i.get("assume_linear", False)) for i in data.get("inputs", [])],

@@ -65,6 +65,23 @@ class SessionTests(unittest.TestCase):
             loaded = TemplateStore.load(f.name)
         self.assertEqual(loaded["stage1"][0].channel, "R")
 
+    def test_session_from_dict_completes_block_params(self):
+        payload = {
+            "stage2_blocks": [
+                {"type": "SATUR", "params": {"global_saturation": 1.3}},
+                {"type": "DECON", "params": {"algorithm": "RL", "iterations": 20}},
+            ],
+        }
+        loaded = Session.from_dict(payload)
+        satur = loaded.stage2_blocks[0].params
+        decon = loaded.stage2_blocks[1].params
+        self.assertEqual(satur["global_saturation"], 1.3)
+        self.assertIn("vibrance", satur)
+        self.assertIn("luma_protection", satur)
+        self.assertEqual(decon["iterations"], 20)
+        self.assertIn("psf_model", decon)
+        self.assertIn("edge_mask_amount", decon)
+
     def test_jpg_format_supported(self):
         self.assertEqual(detect_format("foo.jpg"), ".jpg")
         self.assertEqual(detect_format("foo.jpeg"), ".jpeg")
