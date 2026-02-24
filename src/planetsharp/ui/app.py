@@ -18,7 +18,7 @@ from planetsharp.persistence.template_store import TEMPLATE_SUFFIX, TemplateStor
 from planetsharp.processing.blocks import BLOCK_DEFINITIONS
 
 LAYOUT_STATE = Path.home() / ".planetsharp.layout.json"
-STAGE1_CHANNELS = ("L", "R", "G", "B", "FILTER")
+STAGE1_CHANNELS = ("L", "R", "G", "B")
 BLOCK_COLORS = {
     "DECON": "#a264ff",
     "AWAVE": "#a264ff",
@@ -116,7 +116,9 @@ class PlanetSharpApp:
                 self.session.stage2_blocks.append(BlockInstance(type=code, params=dict(BLOCK_DEFINITIONS[code].defaults)))
 
     def _build_layout(self) -> None:
-        ttk.Style().configure("Treeview", rowheight=28)
+        self.style = ttk.Style()
+        self.style.configure("Treeview", rowheight=28)
+        self.style.map("Treeview", background=[("selected", "#1e1e1e")], foreground=[("selected", "#ffffff")])
 
         bar = ttk.Frame(self.root)
         bar.pack(fill="x", padx=6, pady=4)
@@ -156,9 +158,9 @@ class PlanetSharpApp:
 
         workflow = ttk.Panedwindow(workflow_row, orient="horizontal")
         workflow.pack(fill="both", expand=True)
-        left = ttk.LabelFrame(workflow, text="Building Blocks Library")
+        left = ttk.LabelFrame(workflow, text="Processes")
         center = ttk.LabelFrame(workflow, text="Pipeline Canvas")
-        right = ttk.LabelFrame(workflow, text="Block Parameters")
+        right = ttk.LabelFrame(workflow, text="Process Parameters")
         workflow.add(left, weight=2)
         workflow.add(center, weight=6)
         workflow.add(right, weight=2)
@@ -170,14 +172,14 @@ class PlanetSharpApp:
             self.library.insert("end", f"{name} ({code})")
         self.library.bind("<ButtonPress-1>", self._start_library_drag)
 
-        ttk.Label(center, text="Stage 1 — Preprocessing (L/R/G/B/Filter)", font=("TkDefaultFont", 10, "bold")).pack(fill="x", padx=4, pady=(4, 2))
+        ttk.Label(center, text="Stage 1 — Preprocessing (L/R/G/B)", font=("TkDefaultFont", 10, "bold")).pack(fill="x", padx=4, pady=(4, 2))
         stage1_grid = ttk.Frame(center)
         stage1_grid.pack(fill="both", expand=True, padx=4)
         self.stage1_trees: dict[str, ttk.Treeview] = {}
         for idx, ch in enumerate(STAGE1_CHANNELS):
             pane = tk.Frame(stage1_grid, highlightthickness=2, highlightbackground="#555")
             pane.grid(row=0, column=idx, sticky="nsew", padx=2)
-            stage1_grid.grid_columnconfigure(idx, weight=1)
+            stage1_grid.grid_columnconfigure(idx, weight=1, minsize=120)
             ttk.Label(pane, text=ch, font=("TkDefaultFont", 9, "bold")).pack(fill="x")
             tree = self._make_stage_tree(pane)
             self.stage1_trees[ch] = tree
@@ -205,7 +207,7 @@ class PlanetSharpApp:
     def _make_stage_tree(self, parent: tk.Widget) -> ttk.Treeview:
         tree = ttk.Treeview(parent, columns=("name",), show="headings", selectmode="browse", height=6)
         tree.heading("name", text="Block")
-        tree.column("name", width=180, anchor="w")
+        tree.column("name", width=120, anchor="w")
         tree.pack(fill="both", expand=True, padx=2, pady=2)
         return tree
 
@@ -238,7 +240,24 @@ class PlanetSharpApp:
         for tree in [*self.stage1_trees.values(), self.stage2_tree]:
             for code, color in BLOCK_COLORS.items():
                 tree.tag_configure(code, background=color)
+        self._update_selection_outline()
         self._render_param_editor()
+
+    def _update_selection_outline(self) -> None:
+        all_frames = [self.stage2_frame, *[t.master for t in self.stage1_trees.values()]]
+        for frame in all_frames:
+            frame.configure(highlightbackground="#555")
+        block = self._selected_block()
+        if not block:
+            return
+        target = self.stage2_frame if self.selected_stage.get() == 2 else self.stage1_trees[self.selected_channel.get()].master
+        target.configure(highlightbackground=self._lighten_color(BLOCK_COLORS.get(block.type, "#777"), 0.35))
+
+    def _lighten_color(self, color: str, factor: float) -> str:
+        color = color.lstrip("#")
+        rgb = [int(color[i : i + 2], 16) for i in (0, 2, 4)]
+        out = [min(255, int(c + (255 - c) * factor)) for c in rgb]
+        return f"#{out[0]:02x}{out[1]:02x}{out[2]:02x}"
 
     def _on_select_stage1(self, channel: str) -> None:
         sel = self.stage1_trees[channel].selection()
@@ -248,6 +267,7 @@ class PlanetSharpApp:
         self.selected_channel.set(channel)
         self.selected_block_id = sel[0]
         self._render_param_editor()
+        self._update_selection_outline()
 
     def _on_select(self, stage: int) -> None:
         if stage == 2:
@@ -257,6 +277,7 @@ class PlanetSharpApp:
             self.selected_stage.set(2)
             self.selected_block_id = sel[0]
             self._render_param_editor()
+            self._update_selection_outline()
 
     def _selected_block(self) -> BlockInstance | None:
         for block in self._pipeline_blocks():
@@ -274,14 +295,40 @@ class PlanetSharpApp:
         location = f"Stage 1 [{block.channel}]" if block.channel else "Stage 2"
         ttk.Label(self.param_area, text=f"{BLOCK_DEFINITIONS[block.type].display_name} ({block.type})", font=("TkDefaultFont", 10, "bold")).pack(anchor="w", pady=(0, 4))
         ttk.Label(self.param_area, text=f"Location: {location}").pack(anchor="w", pady=(0, 6))
-        for key, value in block.params.items():
-            if isinstance(value, (int, float)):
-                row = ttk.Frame(self.param_area)
-                row.pack(fill="x", pady=2)
-                ttk.Label(row, text=key, width=16).pack(side="left")
-                var = tk.DoubleVar(value=float(value))
-                scale = ttk.Scale(row, from_=0, to=max(2.0, float(value) * 2 + 1), variable=var, command=lambda _v, k=key, v=var: self._set_param(k, v.get()))
-                scale.pack(side="left", fill="x", expand=True, padx=4)
+        for path, value in self._iter_param_leaves(block.params):
+            self._render_param_control(path, value)
+
+    def _iter_param_leaves(self, params: Any, path: tuple[Any, ...] = ()) -> list[tuple[tuple[Any, ...], Any]]:
+        items: list[tuple[tuple[Any, ...], Any]] = []
+        if isinstance(params, dict):
+            for key, value in params.items():
+                items.extend(self._iter_param_leaves(value, (*path, key)))
+        elif isinstance(params, (list, tuple)):
+            for idx, value in enumerate(params):
+                items.extend(self._iter_param_leaves(value, (*path, idx)))
+        elif isinstance(params, (int, float, bool, str)):
+            items.append((path, params))
+        return items
+
+    def _render_param_control(self, path: tuple[Any, ...], value: Any) -> None:
+        row = ttk.Frame(self.param_area)
+        row.pack(fill="x", pady=2)
+        label = " / ".join(str(part) for part in path)
+        ttk.Label(row, text=label, width=24).pack(side="left")
+        if isinstance(value, bool):
+            var = tk.BooleanVar(value=value)
+            ttk.Checkbutton(row, variable=var, command=lambda p=path, v=var: self._set_param_path(p, v.get())).pack(side="left")
+            return
+        if isinstance(value, (int, float)):
+            var = tk.DoubleVar(value=float(value))
+            scale = ttk.Scale(row, from_=0, to=max(2.0, float(value) * 2 + 1), variable=var, command=lambda _v, p=path, v=var: self._set_param_path(p, v.get()))
+            scale.pack(side="left", fill="x", expand=True, padx=4)
+            return
+        var = tk.StringVar(value=str(value))
+        entry = ttk.Entry(row, textvariable=var)
+        entry.pack(side="left", fill="x", expand=True, padx=4)
+        entry.bind("<FocusOut>", lambda _e, p=path, v=var: self._set_param_path(p, v.get()))
+        entry.bind("<Return>", lambda _e, p=path, v=var: self._set_param_path(p, v.get()))
 
     def _active_stage_blocks(self) -> list[BlockInstance] | None:
         if self.selected_stage.get() == 1:
@@ -291,23 +338,54 @@ class PlanetSharpApp:
         return None
 
     def _set_param(self, key: str, value: Any) -> None:
+        self._set_param_path((key,), value)
+
+    def _set_param_path(self, path: tuple[Any, ...], value: Any) -> None:
         block = self._selected_block()
         if not block:
             return
-        old = block.params.get(key)
-        new = round(float(value), 4)
+        old = self._get_path_value(block.params, path)
+        if old is None:
+            return
+        if isinstance(old, bool):
+            new = bool(value)
+        elif isinstance(old, int) and not isinstance(old, bool):
+            new = int(round(float(value)))
+        elif isinstance(old, float):
+            new = round(float(value), 4)
+        else:
+            new = str(value)
         if old == new:
             return
 
         def do() -> None:
-            block.params[key] = new
+            self._set_path_value(block.params, path, new)
             self._schedule_processing("parameter")
 
         def undo() -> None:
-            block.params[key] = old
+            self._set_path_value(block.params, path, old)
             self._schedule_processing("parameter")
 
         self.history.execute(Command(do=do, undo=undo, description="Param"))
+
+    def _get_path_value(self, root: Any, path: tuple[Any, ...]) -> Any:
+        current = root
+        for part in path:
+            current = current[part]
+        return current
+
+    def _set_path_value(self, root: Any, path: tuple[Any, ...], value: Any) -> None:
+        current = root
+        for part in path[:-1]:
+            current = current[part]
+        leaf = path[-1]
+        if isinstance(current, tuple):
+            mutable = list(current)
+            mutable[leaf] = value
+            value = tuple(mutable)
+            self._set_path_value(root, path[:-1], value)
+            return
+        current[leaf] = value
 
     def _code_from_library_selection(self) -> str | None:
         sel = self.library.curselection()
@@ -461,7 +539,7 @@ class PlanetSharpApp:
 
         def worker() -> None:
             upstream = dict(self.loaded_image)
-            upstream["channels_signal"] = {"L": 0.0, "R": 0.0, "G": 0.0, "B": 0.0, "FILTER": 0.0}
+            upstream["channels_signal"] = {"L": 0.0, "R": 0.0, "G": 0.0, "B": 0.0}
             upstream_key = hashlib.sha1((self.loaded_image.get("path", "") + str(self.loaded_image.get("format", ""))).encode()).hexdigest()
             for idx, block in enumerate(self._pipeline_blocks()):
                 sig = signatures[idx]
@@ -469,8 +547,8 @@ class PlanetSharpApp:
                 out = dict(upstream)
                 out["channels_signal"] = dict(upstream["channels_signal"])
                 if block.enabled:
-                    bump = round((idx + 1) * 0.01, 4)
-                    channel = block.channel or "FILTER"
+                    bump = round((idx + 1) * 0.01 + self._param_signal(block.params), 4)
+                    channel = block.channel or "L"
                     out["channels_signal"][channel] = round(out["channels_signal"].get(channel, 0.0) + bump, 4)
                 out["signal"] = round(sum(out["channels_signal"].values()), 4)
                 out["last_block"] = block.type
@@ -484,6 +562,19 @@ class PlanetSharpApp:
 
         self._processing_thread = threading.Thread(target=worker, daemon=True)
         self._processing_thread.start()
+
+    def _param_signal(self, value: Any) -> float:
+        if isinstance(value, bool):
+            return 0.005 if value else 0.0
+        if isinstance(value, (int, float)):
+            return abs(float(value)) * 0.001
+        if isinstance(value, str):
+            return (sum(ord(ch) for ch in value) % 10) * 0.0005
+        if isinstance(value, dict):
+            return sum(self._param_signal(v) for v in value.values())
+        if isinstance(value, (list, tuple)):
+            return sum(self._param_signal(v) for v in value)
+        return 0.0
 
     def _finish_processing(self, output: dict[str, Any]) -> None:
         self.processed_image = output
