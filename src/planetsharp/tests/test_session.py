@@ -7,6 +7,7 @@ from planetsharp.persistence.session_store import SessionStore
 from planetsharp.persistence.template_store import TemplateStore
 from planetsharp.processing.engine import WorkflowEngine
 from planetsharp.io.formats import detect_format
+from planetsharp.ui.app import PlanetSharpApp
 
 
 class SessionTests(unittest.TestCase):
@@ -85,6 +86,20 @@ class SessionTests(unittest.TestCase):
     def test_jpg_format_supported(self):
         self.assertEqual(detect_format("foo.jpg"), ".jpg")
         self.assertEqual(detect_format("foo.jpeg"), ".jpeg")
+
+    def test_processed_overlay_levels_reflect_channel_signal(self):
+        levels = PlanetSharpApp._overlay_levels({"channels_signal": {"L": 0.08, "R": 0.04, "G": 0.02, "B": 0.01}})
+        self.assertEqual(levels["L"], 0.32)
+        self.assertEqual(levels["R"], 0.32)
+        self.assertEqual(levels["G"], 0.16)
+        self.assertEqual(levels["B"], 0.08)
+
+    def test_processed_overlay_levels_are_clamped(self):
+        levels = PlanetSharpApp._overlay_levels({"channels_signal": {"L": -1.0, "R": 0.5, "G": -0.9, "B": 5}})
+        self.assertEqual(levels["L"], 1.0)
+        self.assertEqual(levels["R"], 1.0)
+        self.assertEqual(levels["G"], 1.0)
+        self.assertEqual(levels["B"], 1.0)
 
 
 if __name__ == "__main__":

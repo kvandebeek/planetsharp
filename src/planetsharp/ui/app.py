@@ -101,6 +101,7 @@ class PlanetSharpApp:
         self._viewer_source_image: tk.PhotoImage | None = None
         self._viewer_display_image: tk.PhotoImage | None = None
         self._cpu_history: list[float] = [0.0] * 20
+        self._overlay_stipples = ("gray75", "gray50", "gray25", "gray12")
 
         self._build_layout()
         self._bind_shortcuts()
@@ -602,9 +603,56 @@ class PlanetSharpApp:
             return
         self._viewer_display_image = self._fit_photo(self._viewer_source_image, w - 16, h - 16)
         self.viewer_canvas.create_image(w // 2, h // 2, image=self._viewer_display_image, anchor="center")
+        if source is self.processed_image:
+            self._draw_processed_overlay(source, w, h)
         sig = source.get("channels_signal", {})
         overlay = f"signal {source.get('signal', 0.0)} | L:{sig.get('L',0)} R:{sig.get('R',0)} G:{sig.get('G',0)} B:{sig.get('B',0)}"
         self.viewer_canvas.create_text(8, 8, anchor="nw", fill="#90ee90", text=overlay)
+
+    @staticmethod
+    def _overlay_levels(source: dict[str, Any]) -> dict[str, float]:
+        signals = source.get("channels_signal", {})
+        return {
+            "L": min(1.0, max(0.0, abs(float(signals.get("L", 0.0))) * 4.0)),
+            "R": min(1.0, max(0.0, abs(float(signals.get("R", 0.0))) * 8.0)),
+            "G": min(1.0, max(0.0, abs(float(signals.get("G", 0.0))) * 8.0)),
+            "B": min(1.0, max(0.0, abs(float(signals.get("B", 0.0))) * 8.0)),
+        }
+
+    def _draw_processed_overlay(self, source: dict[str, Any], width: int, height: int) -> None:
+        levels = self._overlay_levels(source)
+        luminance_level = levels["L"]
+        if luminance_level > 0.01:
+            self.viewer_canvas.create_rectangle(
+                0,
+                0,
+                width,
+                height,
+                fill="#ffffff",
+                stipple=self._overlay_stipple_for_level(luminance_level),
+                outline="",
+            )
+        for channel, color, x0, y0, x1, y1 in [
+            ("R", "#ff4d4d", 0, 0, width, height // 2),
+            ("G", "#33dd66", 0, height // 2, width // 2, height),
+            ("B", "#4d6dff", width // 2, height // 2, width, height),
+        ]:
+            level = levels[channel]
+            if level <= 0.01:
+                continue
+            self.viewer_canvas.create_rectangle(
+                x0,
+                y0,
+                x1,
+                y1,
+                fill=color,
+                stipple=self._overlay_stipple_for_level(level),
+                outline="",
+            )
+
+    def _overlay_stipple_for_level(self, level: float) -> str:
+        index = min(len(self._overlay_stipples) - 1, max(0, int(level * len(self._overlay_stipples))))
+        return self._overlay_stipples[index]
 
     def _open_any(self) -> None:
         path = filedialog.askopenfilename(
