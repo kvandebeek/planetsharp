@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Any
 
@@ -30,3 +31,31 @@ BLOCK_DEFINITIONS: dict[str, BlockDefinition] = {
     "CONTR": BlockDefinition("CONTR", "Contrast", {"global_contrast": 1.0, "midtone_contrast": 0.0, "highlight_protection": True}),
     "SATUR": BlockDefinition("SATUR", "Saturation", {"global_saturation": 1.0, "vibrance": 0.0, "luma_protection": True}),
 }
+
+
+def complete_block_params(block_type: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Return params with all required defaults for a block type filled in."""
+    if block_type not in BLOCK_DEFINITIONS:
+        return copy.deepcopy(params or {})
+    return _merge_defaults(BLOCK_DEFINITIONS[block_type].defaults, params or {})
+
+
+def _merge_defaults(defaults: Any, params: Any) -> Any:
+    if isinstance(defaults, dict):
+        incoming = params if isinstance(params, dict) else {}
+        merged: dict[str, Any] = {}
+        for key, default_value in defaults.items():
+            merged[key] = _merge_defaults(default_value, incoming.get(key))
+        for key, value in incoming.items():
+            if key not in merged:
+                merged[key] = copy.deepcopy(value)
+        return merged
+    if isinstance(defaults, list):
+        incoming = params if isinstance(params, list) else []
+        merged_list: list[Any] = []
+        for idx, default_item in enumerate(defaults):
+            merged_list.append(_merge_defaults(default_item, incoming[idx] if idx < len(incoming) else None))
+        if len(incoming) > len(defaults):
+            merged_list.extend(copy.deepcopy(item) for item in incoming[len(defaults) :])
+        return merged_list
+    return copy.deepcopy(defaults if params is None else params)

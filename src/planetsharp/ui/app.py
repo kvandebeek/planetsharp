@@ -15,7 +15,7 @@ from typing import Any, Callable
 from planetsharp.core.models import BlockInstance, Session
 from planetsharp.io.formats import read_image, write_image
 from planetsharp.persistence.template_store import TEMPLATE_SUFFIX, TemplateStore
-from planetsharp.processing.blocks import BLOCK_DEFINITIONS
+from planetsharp.processing.blocks import BLOCK_DEFINITIONS, complete_block_params
 
 LAYOUT_STATE = Path.home() / ".planetsharp.layout.json"
 STAGE1_CHANNELS = ("L", "R", "G", "B")
@@ -106,6 +106,7 @@ class PlanetSharpApp:
         self._bind_shortcuts()
         self._restore_ui_state()
         self._seed_pipeline()
+        self._normalize_all_block_params()
         self._refresh_pipeline_views()
         self._refresh_viewer()
         self._tick_cpu_usage()
@@ -113,7 +114,11 @@ class PlanetSharpApp:
     def _seed_pipeline(self) -> None:
         if not self.session.stage2_blocks:
             for code in ("DECON", "SATUR", "CURVE"):
-                self.session.stage2_blocks.append(BlockInstance(type=code, params=dict(BLOCK_DEFINITIONS[code].defaults)))
+                self.session.stage2_blocks.append(BlockInstance(type=code, params=complete_block_params(code)))
+
+    def _normalize_all_block_params(self) -> None:
+        for block in self._pipeline_blocks():
+            block.params = complete_block_params(block.type, block.params)
 
     def _build_layout(self) -> None:
         self.style = ttk.Style()
@@ -506,7 +511,7 @@ class PlanetSharpApp:
         if not tree or not stage:
             self._drag_from_library = None
             return
-        block = BlockInstance(type=self._drag_from_library, params=dict(BLOCK_DEFINITIONS[self._drag_from_library].defaults), channel=channel)
+        block = BlockInstance(type=self._drag_from_library, params=complete_block_params(self._drag_from_library), channel=channel)
         if stage == 1 and channel:
             self._stage1_blocks(channel).append(block)
             self.selected_channel.set(channel)
@@ -652,8 +657,11 @@ class PlanetSharpApp:
             self.session.stage1_workflows[ch].blocks.clear()
         for block in loaded["stage1"]:
             ch = block.channel if block.channel in STAGE1_CHANNELS else "L"
+            block.params = complete_block_params(block.type, block.params)
             self.session.stage1_workflows[ch].blocks.append(block)
         self.session.stage2_blocks = loaded["stage2"]
+        for block in self.session.stage2_blocks:
+            block.params = complete_block_params(block.type, block.params)
         self.selected_block_id = None
         self._refresh_pipeline_views()
         self.status.set(f"Loaded template {Path(path).name}")
