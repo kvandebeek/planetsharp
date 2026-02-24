@@ -82,7 +82,6 @@ class PlanetSharpApp:
         self.root.geometry("1400x900")
 
         self.status = tk.StringVar(value="Ready")
-        self.viewer_mode = tk.StringVar(value="Before")
         self.selected_stage = tk.IntVar(value=1)
         self.selected_channel = tk.StringVar(value="L")
 
@@ -153,10 +152,6 @@ class PlanetSharpApp:
         viewer.pack(fill="both", expand=True, padx=4, pady=4)
         row = ttk.Frame(viewer)
         row.pack(fill="x", padx=4, pady=4)
-        ttk.Label(row, text="Mode").pack(side="left")
-        self.viewer_combo = ttk.Combobox(row, textvariable=self.viewer_mode, state="readonly", values=["Before", "After"], width=20)
-        self.viewer_combo.pack(side="left", padx=4)
-        self.viewer_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_viewer())
         ttk.Button(row, text="Fit", command=self._refresh_viewer).pack(side="left", padx=4)
         self.viewer_canvas = tk.Canvas(viewer, background="#111")
         self.viewer_canvas.pack(fill="both", expand=True, padx=4, pady=4)
@@ -594,16 +589,13 @@ class PlanetSharpApp:
         if not self.loaded_image:
             self.viewer_canvas.create_text(w // 2, h // 2, fill="white", text="No image loaded")
             return
-        source = self.loaded_image if self.viewer_mode.get() == "Before" else self.processed_image
-        if source is None:
-            self.viewer_canvas.create_text(w // 2, h // 2, fill="white", text="Processing…")
-            return
+        source = self.processed_image or self.loaded_image
         if not self._viewer_source_image:
             self.viewer_canvas.create_text(w // 2, h // 2, fill="white", text="Image unavailable")
             return
         self._viewer_display_image = self._fit_photo(self._viewer_source_image, w - 16, h - 16)
         self.viewer_canvas.create_image(w // 2, h // 2, image=self._viewer_display_image, anchor="center")
-        if source is self.processed_image:
+        if self.processed_image is not None:
             self._draw_processed_overlay(source, w, h)
         sig = source.get("channels_signal", {})
         overlay = f"signal {source.get('signal', 0.0)} | L:{sig.get('L',0)} R:{sig.get('R',0)} G:{sig.get('G',0)} B:{sig.get('B',0)}"
@@ -684,7 +676,6 @@ class PlanetSharpApp:
         self._viewer_source_image = preview
         self.loaded_image_path = path
         self.processed_image = None
-        self.viewer_mode.set("Before")
         self.status.set(f"Loaded {Path(path).name}")
         self._refresh_viewer()
         self._schedule_processing("image-load")
@@ -721,14 +712,14 @@ class PlanetSharpApp:
             TemplateStore.save(path, self.session)
 
     def _export_image(self) -> None:
-        source = self.loaded_image if self.viewer_mode.get() == "Before" else self.processed_image
+        source = self.processed_image or self.loaded_image
         if source is None:
             messagebox.showerror("PlanetSharp", "No image loaded")
             return
         path = filedialog.asksaveasfilename(title="Export image", defaultextension=".png", filetypes=[("PNG", "*.png"), ("BMP", "*.bmp"), ("TIFF", "*.tif *.tiff"), ("JPEG", "*.jpg *.jpeg"), ("XISF", "*.xisf"), ("FITS", "*.fits")])
         if path:
             write_image(path, source, bit_depth=16)
-            self.status.set(f"Exported {Path(path).name} ({self.viewer_mode.get()})")
+            self.status.set(f"Exported {Path(path).name}")
 
     def _undo(self) -> None:
         if self.history.undo():
@@ -765,14 +756,13 @@ class PlanetSharpApp:
             return 0.0
 
     def _save_ui_state(self) -> None:
-        LAYOUT_STATE.write_text(json.dumps({"viewer_mode": self.viewer_mode.get(), "geometry": self.root.geometry()}, indent=2), encoding="utf-8")
+        LAYOUT_STATE.write_text(json.dumps({"geometry": self.root.geometry()}, indent=2), encoding="utf-8")
 
     def _restore_ui_state(self) -> None:
         if not LAYOUT_STATE.exists():
             return
         try:
             state = json.loads(LAYOUT_STATE.read_text(encoding="utf-8"))
-            self.viewer_mode.set(state.get("viewer_mode", "Before"))
             if geometry := state.get("geometry"):
                 self.root.geometry(geometry)
         except json.JSONDecodeError:
