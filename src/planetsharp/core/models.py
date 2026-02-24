@@ -109,6 +109,9 @@ class Session:
     roi: ROI = field(default_factory=ROI)
     performance: PerformanceSettings = field(default_factory=PerformanceSettings)
     viewer_state: ViewerState = field(default_factory=ViewerState)
+    stage1_blocks: list[BlockInstance] = field(default_factory=list)
+    stage2_blocks: list[BlockInstance] = field(default_factory=list)
+    selected_stage: int = 1
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -135,7 +138,12 @@ class Session:
 
         stage2 = Workflow(blocks=[BlockInstance(**b) for b in data.get("stage2_workflow", {}).get("blocks", [])])
 
-        return cls(
+        stage1_blocks = [BlockInstance(**b) for b in data.get("stage1_blocks", [])]
+        stage2_blocks = [BlockInstance(**b) for b in data.get("stage2_blocks", [])]
+        if not stage1_blocks and not stage2_blocks:
+            stage2_blocks = [BlockInstance(**b) for b in data.get("stage2_workflow", {}).get("blocks", [])]
+
+        session = cls(
             inputs=[InputImage(path=i["path"], role=Role(i.get("role", "FILTER")), filter_name=i.get("filter_name", ""), assume_linear=i.get("assume_linear", False)) for i in data.get("inputs", [])],
             filter_mapping=filter_mapping,
             stage1_workflows=stage1,
@@ -144,7 +152,13 @@ class Session:
             roi=ROI(**data.get("roi", {})),
             performance=PerformanceSettings(**data.get("performance", {})),
             viewer_state=ViewerState(**data.get("viewer_state", {})),
+            stage1_blocks=stage1_blocks,
+            stage2_blocks=stage2_blocks,
+            selected_stage=data.get("selected_stage", 1),
         )
+        if not session.stage2_workflow.blocks and session.stage2_blocks:
+            session.stage2_workflow.blocks = list(session.stage2_blocks)
+        return session
 
     def resolve_paths(self, base: Path) -> None:
         for image in self.inputs:
