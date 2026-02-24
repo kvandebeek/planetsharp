@@ -3,11 +3,12 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import math
 import threading
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import TclError, filedialog, messagebox, ttk
 from typing import Any, Callable
 
 from planetsharp.core.models import BlockInstance, Session
@@ -81,6 +82,10 @@ class PlanetSharpApp:
         self._drag_from_library: str | None = None
         self._drag_block_id: str | None = None
         self._drag_source_stage: int | None = None
+        self._drag_insert_row: str | None = None
+        self._drag_insert_after = False
+        self._viewer_source_image: tk.PhotoImage | None = None
+        self._viewer_display_image: tk.PhotoImage | None = None
 
         self._build_layout()
         self._bind_shortcuts()
@@ -107,24 +112,15 @@ class PlanetSharpApp:
             ttk.Button(bar, text=label, command=cmd).pack(side="left", padx=2)
         ttk.Label(bar, textvariable=self.status).pack(side="right")
 
-        self.main = ttk.Panedwindow(self.root, orient="horizontal")
+        self.main = ttk.Panedwindow(self.root, orient="vertical")
         self.main.pack(fill="both", expand=True)
-        left = ttk.Frame(self.main)
-        center = ttk.Frame(self.main)
-        right = ttk.Frame(self.main)
-        self.main.add(left, weight=2)
-        self.main.add(center, weight=6)
-        self.main.add(right, weight=3)
 
-        ttk.Label(left, text="Building Blocks Library").pack(anchor="w", padx=4, pady=4)
-        self.library = tk.Listbox(left, exportselection=False, height=16)
-        self.library.pack(fill="both", expand=True, padx=4, pady=4)
-        for code in sorted(BLOCK_DEFINITIONS):
-            name = BLOCK_DEFINITIONS[code].display_name
-            self.library.insert("end", f"{name} ({code})")
-        self.library.bind("<ButtonPress-1>", self._start_library_drag)
+        viewer_row = ttk.Frame(self.main)
+        workflow_row = ttk.Frame(self.main)
+        self.main.add(viewer_row, weight=6)
+        self.main.add(workflow_row, weight=3)
 
-        viewer = ttk.LabelFrame(center, text="Viewer")
+        viewer = ttk.LabelFrame(viewer_row, text="Viewer")
         viewer.pack(fill="both", expand=True, padx=4, pady=4)
         row = ttk.Frame(viewer)
         row.pack(fill="x", padx=4, pady=4)
@@ -133,39 +129,60 @@ class PlanetSharpApp:
         self.viewer_combo.pack(side="left", padx=4)
         self.viewer_combo.bind("<<ComboboxSelected>>", lambda _e: self._refresh_viewer())
         ttk.Button(row, text="Fit", command=self._refresh_viewer).pack(side="left", padx=4)
-        self.viewer_canvas = tk.Canvas(viewer, background="#111", height=380)
+        self.viewer_canvas = tk.Canvas(viewer, background="#111")
         self.viewer_canvas.pack(fill="both", expand=True, padx=4, pady=4)
+        self.viewer_canvas.bind("<Configure>", lambda _e: self._refresh_viewer())
 
-        pipeline = ttk.LabelFrame(center, text="Pipeline Canvas")
-        pipeline.pack(fill="both", expand=True, padx=4, pady=4)
-        ttk.Label(pipeline, text="Stage 1 — Preprocessing", font=("TkDefaultFont", 10, "bold")).pack(fill="x", padx=4, pady=(4, 2))
-        self.stage1_tree = self._make_stage_tree(pipeline)
-        ttk.Separator(pipeline, orient="horizontal").pack(fill="x", padx=4, pady=8)
-        ttk.Label(pipeline, text="Stage 2 — Enhancement", font=("TkDefaultFont", 10, "bold")).pack(fill="x", padx=4, pady=(2, 2))
-        self.stage2_tree = self._make_stage_tree(pipeline)
+        workflow = ttk.Panedwindow(workflow_row, orient="horizontal")
+        workflow.pack(fill="both", expand=True)
+        left = ttk.LabelFrame(workflow, text="Building Blocks Library")
+        center = ttk.LabelFrame(workflow, text="Pipeline Canvas")
+        right = ttk.LabelFrame(workflow, text="Block Parameters")
+        workflow.add(left, weight=2)
+        workflow.add(center, weight=4)
+        workflow.add(right, weight=2)
+
+        self.library = tk.Listbox(left, exportselection=False)
+        self.library.pack(fill="both", expand=True, padx=4, pady=4)
+        for code in sorted(BLOCK_DEFINITIONS):
+            name = BLOCK_DEFINITIONS[code].display_name
+            self.library.insert("end", f"{name} ({code})")
+        self.library.bind("<ButtonPress-1>", self._start_library_drag)
+
+        ttk.Label(center, text="Stage 1 — Preprocessing", font=("TkDefaultFont", 10, "bold")).pack(fill="x", padx=4, pady=(4, 2))
+        self.stage1_frame = tk.Frame(center, highlightthickness=2, highlightbackground="#555")
+        self.stage1_frame.pack(fill="both", expand=True, padx=4)
+        self.stage1_tree = self._make_stage_tree(self.stage1_frame)
+
+        ttk.Separator(center, orient="horizontal").pack(fill="x", padx=4, pady=8)
+        ttk.Label(center, text="Stage 2 — Enhancement", font=("TkDefaultFont", 10, "bold")).pack(fill="x", padx=4, pady=(2, 2))
+        self.stage2_frame = tk.Frame(center, highlightthickness=2, highlightbackground="#555")
+        self.stage2_frame.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        self.stage2_tree = self._make_stage_tree(self.stage2_frame)
+        self.stage1_tree.tag_configure("insert_marker", background="#264f78")
+        self.stage2_tree.tag_configure("insert_marker", background="#264f78")
 
         for tree, stage in ((self.stage1_tree, 1), (self.stage2_tree, 2)):
             tree.bind("<<TreeviewSelect>>", lambda _e, s=stage: self._on_select(s))
             tree.bind("<ButtonPress-1>", lambda e, s=stage: self._start_tree_drag(e, s))
-            tree.bind("<ButtonRelease-1>", lambda e, s=stage: self._drop_on_tree(e, s))
+            tree.bind("<B1-Motion>", self._drag_motion)
+            tree.bind("<ButtonRelease-1>", self._drop_on_tree)
 
-        controls = ttk.Frame(pipeline)
+        controls = ttk.Frame(center)
         controls.pack(fill="x", padx=4, pady=4)
         for label, cmd in [("▲", self._move_up), ("▼", self._move_down), ("Enable/Disable", self._toggle_enabled), ("Duplicate", self._duplicate_selected), ("Delete", self._delete_selected)]:
             ttk.Button(controls, text=label, command=cmd).pack(side="left", padx=2)
 
-        inspector = ttk.LabelFrame(right, text="Block parameters")
-        inspector.pack(fill="both", expand=True, padx=4, pady=4)
-        self.param_area = ttk.Frame(inspector)
+        self.param_area = ttk.Frame(right)
         self.param_area.pack(fill="both", expand=True, padx=4, pady=4)
 
-    def _make_stage_tree(self, parent: ttk.Widget) -> ttk.Treeview:
+    def _make_stage_tree(self, parent: tk.Widget) -> ttk.Treeview:
         tree = ttk.Treeview(parent, columns=("enabled", "name"), show="headings", selectmode="browse", height=6)
         tree.heading("enabled", text="Enabled")
         tree.heading("name", text="Block")
         tree.column("enabled", width=80, anchor="center")
         tree.column("name", width=320, anchor="w")
-        tree.pack(fill="x", padx=4)
+        tree.pack(fill="both", expand=True, padx=4, pady=2)
         return tree
 
     def _bind_shortcuts(self) -> None:
@@ -357,34 +374,84 @@ class PlanetSharpApp:
 
     def _start_library_drag(self, _event: tk.Event) -> None:
         self._drag_from_library = self._code_from_library_selection()
+        if self._drag_from_library:
+            self.root.configure(cursor="hand2")
 
     def _start_tree_drag(self, event: tk.Event, stage: int) -> None:
         tree = self.stage1_tree if stage == 1 else self.stage2_tree
         row = tree.identify_row(event.y)
         self._drag_block_id = row or None
         self._drag_source_stage = stage if row else None
+        if row:
+            self.root.configure(cursor="fleur")
 
-    def _drop_on_tree(self, event: tk.Event, stage: int) -> None:
-        tree = self.stage1_tree if stage == 1 else self.stage2_tree
+    def _tree_under_pointer(self, x_root: int, y_root: int) -> tuple[ttk.Treeview | None, int | None]:
+        widget = self.root.winfo_containing(x_root, y_root)
+        for tree, stage in ((self.stage1_tree, 1), (self.stage2_tree, 2)):
+            if widget is tree or (widget and str(widget).startswith(str(tree))):
+                return tree, stage
+        return None, None
+
+    def _clear_drag_visuals(self) -> None:
+        for frame in (self.stage1_frame, self.stage2_frame):
+            frame.configure(highlightbackground="#555")
+        for tree in (self.stage1_tree, self.stage2_tree):
+            for iid in tree.get_children():
+                tree.item(iid, tags=())
+
+    def _drag_motion(self, event: tk.Event) -> None:
+        if not (self._drag_from_library or self._drag_block_id):
+            return
+        tree, stage = self._tree_under_pointer(event.x_root, event.y_root)
+        self._drag_insert_row = None
+        self._drag_insert_after = False
+        self._clear_drag_visuals()
+        if not tree or not stage:
+            return
+        (self.stage1_frame if stage == 1 else self.stage2_frame).configure(highlightbackground="#4a90e2")
+        y = event.y_root - tree.winfo_rooty()
+        row = tree.identify_row(y)
+        if not row:
+            return
+        self._drag_insert_row = row
+        bbox = tree.bbox(row)
+        if bbox:
+            self._drag_insert_after = y > (bbox[1] + bbox[3] / 2)
+        tree.item(row, tags=("insert_marker",))
+
+    def _drop_on_tree(self, event: tk.Event) -> None:
+        tree, stage = self._tree_under_pointer(event.x_root, event.y_root)
+        self.root.configure(cursor="")
+        if not tree or not stage:
+            self._drag_from_library = None
+            self._drag_block_id = None
+            self._drag_source_stage = None
+            self._clear_drag_visuals()
+            return
         target_blocks = self.session.stage1_blocks if stage == 1 else self.session.stage2_blocks
-        target_row = tree.identify_row(event.y)
+        target_row = self._drag_insert_row
         insert_index = len(target_blocks)
         if target_row:
-            insert_index = target_blocks.index(next(b for b in target_blocks if b.id == target_row))
+            insert_index = target_blocks.index(next(b for b in target_blocks if b.id == target_row)) + (1 if self._drag_insert_after else 0)
         if self._drag_from_library:
             block = BlockInstance(type=self._drag_from_library, params=dict(BLOCK_DEFINITIONS[self._drag_from_library].defaults))
             target_blocks.insert(insert_index, block)
             self._drag_from_library = None
+            self.selected_stage.set(stage)
+            self.selected_block_id = block.id
             self._refresh_pipeline_views()
             self._schedule_processing("drag-insert")
+            self._clear_drag_visuals()
             return
         if not self._drag_block_id or not self._drag_source_stage:
+            self._clear_drag_visuals()
             return
         src_blocks = self.session.stage1_blocks if self._drag_source_stage == 1 else self.session.stage2_blocks
         block = next((candidate for candidate in src_blocks if candidate.id == self._drag_block_id), None)
         if block is None:
             self._drag_block_id = None
             self._drag_source_stage = None
+            self._clear_drag_visuals()
             return
 
         src_index = src_blocks.index(block)
@@ -397,6 +464,7 @@ class PlanetSharpApp:
         self.selected_block_id = block.id
         self._drag_block_id = None
         self._drag_source_stage = None
+        self._clear_drag_visuals()
         self._refresh_pipeline_views()
         self._schedule_processing("drag-move")
 
@@ -462,19 +530,23 @@ class PlanetSharpApp:
 
     def _refresh_viewer(self) -> None:
         self.viewer_canvas.delete("all")
+        canvas_w = max(self.viewer_canvas.winfo_width(), 1)
+        canvas_h = max(self.viewer_canvas.winfo_height(), 1)
         if not self.loaded_image:
-            self.viewer_canvas.create_text(420, 180, fill="white", text="No image loaded")
+            self.viewer_canvas.create_text(canvas_w // 2, canvas_h // 2, fill="white", text="No image loaded")
             return
         source = self.loaded_image if self.viewer_mode.get() == "Before" else self.processed_image
         if source is None:
-            self.viewer_canvas.create_text(420, 180, fill="white", text="Processing…")
+            self.viewer_canvas.create_text(canvas_w // 2, canvas_h // 2, fill="white", text="Processing…")
             return
-        label = Path(source.get("path", "")).name or "image"
+        if not self._viewer_source_image:
+            self.viewer_canvas.create_text(canvas_w // 2, canvas_h // 2, fill="white", text="Image unavailable")
+            return
+        self._viewer_display_image = self._fit_photo(self._viewer_source_image, canvas_w - 16, canvas_h - 16)
+        self.viewer_canvas.create_image(canvas_w // 2, canvas_h // 2, image=self._viewer_display_image, anchor="center")
         mode = self.viewer_mode.get()
-        self.viewer_canvas.create_rectangle(80, 50, 760, 320, outline="#6bc1ff", width=2)
-        self.viewer_canvas.create_text(420, 140, fill="white", text=f"{label}")
-        self.viewer_canvas.create_text(420, 180, fill="#90ee90", text=f"Mode: {mode}")
-        self.viewer_canvas.create_text(420, 220, fill="#cccccc", text=f"Signal: {source.get('signal', 0.0)}")
+        signal = source.get("signal", 0.0)
+        self.viewer_canvas.create_text(8, 8, anchor="nw", fill="#90ee90", text=f"{mode} • signal {signal}")
 
     def _open_any(self) -> None:
         path = filedialog.askopenfilename(
@@ -489,17 +561,35 @@ class PlanetSharpApp:
             self._open_image(path)
 
     def _open_image(self, path: str) -> None:
+        previous_meta = self.loaded_image
+        previous_preview = self._viewer_source_image
         try:
-            self.loaded_image = read_image(path)
+            loaded = read_image(path)
+            preview = tk.PhotoImage(file=path)
         except ValueError as exc:
             messagebox.showerror("PlanetSharp", str(exc))
             return
+        except TclError as exc:
+            self.loaded_image = previous_meta
+            self._viewer_source_image = previous_preview
+            messagebox.showerror("PlanetSharp", f"Unable to decode image: {exc}")
+            return
+        self.loaded_image = loaded
+        self._viewer_source_image = preview
         self.loaded_image_path = path
         self.processed_image = None
         self.viewer_mode.set("Before")
         self.status.set(f"Loaded {Path(path).name}")
         self._refresh_viewer()
         self._schedule_processing("image-load")
+
+    def _fit_photo(self, image: tk.PhotoImage, max_w: int, max_h: int) -> tk.PhotoImage:
+        max_w = max(max_w, 1)
+        max_h = max(max_h, 1)
+        if image.width() <= max_w and image.height() <= max_h:
+            return image
+        factor = max(1, math.ceil(max(image.width() / max_w, image.height() / max_h)))
+        return image.subsample(factor, factor)
 
     def _open_template(self, path: str) -> None:
         try:
