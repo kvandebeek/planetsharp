@@ -4,7 +4,7 @@ from typing import Callable
 
 import numpy as np
 from PySide6.QtCore import QPoint, Qt, Signal
-from PySide6.QtGui import QImage, QMouseEvent, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QImage, QMouseEvent, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QGraphicsPixmapItem, QGraphicsScene, QGraphicsView, QWidget
 
 
@@ -99,6 +99,7 @@ class HistogramWidget(QWidget):
         self._image: np.ndarray | None = None
         self._mode = "luminance"
         self._scale = "linear"
+        self._levels_overlay: dict[str, dict[str, float]] | None = None
         self.setMinimumHeight(180)
 
     def set_image(self, image_float: np.ndarray | None) -> None:
@@ -111,6 +112,10 @@ class HistogramWidget(QWidget):
 
     def set_scale(self, scale: str) -> None:
         self._scale = scale
+        self.update()
+
+    def set_levels_overlay(self, payload: dict[str, dict[str, float]] | None) -> None:
+        self._levels_overlay = payload
         self.update()
 
     def _compute_hist(self) -> list[np.ndarray]:
@@ -150,3 +155,44 @@ class HistogramWidget(QWidget):
                 px = int((x / 255.0) * (w - 1))
                 bar_h = int(norm[x] * (h - 1))
                 painter.drawLine(px, h - 1, px, h - 1 - bar_h)
+
+        if self._levels_overlay is not None:
+            self._paint_levels_overlay(painter, w, h)
+
+    def _paint_levels_overlay(self, painter: QPainter, width: int, height: int) -> None:
+        if self._levels_overlay is None:
+            return
+        boundaries = self._levels_overlay.get("boundaries", {})
+        adjustments = self._levels_overlay.get("adjustments", {})
+        segments = [
+            ("Shadows", 0.0, float(boundaries.get("shadow_upper", 0.25)), float(adjustments.get("shadows", 0.0)), Qt.GlobalColor.darkBlue),
+            ("Low-mid", float(boundaries.get("low_mid_lower", 0.30)), float(boundaries.get("low_mid_upper", 0.50)), float(adjustments.get("low_mid", 0.0)), Qt.GlobalColor.darkCyan),
+            ("High-mid", float(boundaries.get("high_mid_lower", 0.60)), float(boundaries.get("high_mid_upper", 0.78)), float(adjustments.get("high_mid", 0.0)), Qt.GlobalColor.darkYellow),
+            ("Highlights", float(boundaries.get("highlights_lower", 0.86)), 1.0, float(adjustments.get("highlights", 0.0)), Qt.GlobalColor.darkRed),
+        ]
+
+        for _name, left, right, amount, color in segments:
+            x0 = int(np.clip(left, 0.0, 1.0) * (width - 1))
+            x1 = int(np.clip(right, 0.0, 1.0) * (width - 1))
+            if x1 <= x0:
+                continue
+            alpha = int(35 + min(110, abs(amount) * 360))
+            tonal_overlay = QColor(255, 255, 255, alpha) if amount >= 0 else QColor(0, 0, 0, alpha)
+            painter.fillRect(x0, 0, x1 - x0, height, tonal_overlay)
+            painter.setOpacity(0.30)
+            painter.fillRect(x0, 0, x1 - x0, height, color)
+            painter.setOpacity(1.0)
+
+        boundary_color = QPen(Qt.GlobalColor.lightGray, 1, Qt.PenStyle.DashLine)
+        painter.setPen(boundary_color)
+        boundary_keys = [
+            "shadow_upper",
+            "low_mid_lower",
+            "low_mid_upper",
+            "high_mid_lower",
+            "high_mid_upper",
+            "highlights_lower",
+        ]
+        for key in boundary_keys:
+            x = int(np.clip(float(boundaries.get(key, 0.0)), 0.0, 1.0) * (width - 1))
+            painter.drawLine(x, 0, x, height - 1)
