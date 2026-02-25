@@ -74,6 +74,7 @@ class MainWindow(QMainWindow):
         self.original_native: np.ndarray | None = None
         self.original_float: np.ndarray | None = None
         self.rendered_float: np.ndarray | None = None
+        self.original_clip_counts: tuple[int, int] = (0, 0)
         self.pipeline = []
         self.default_image_folder = load_default_image_folder()
         self._pipeline_apply_timer = QTimer(self)
@@ -537,21 +538,37 @@ class MainWindow(QMainWindow):
             self.rendered_float = None
             self.viewer.set_image(None)
             self.histogram.set_image(None)
-            self.clip_label.setText("clipped low=0, high=0")
+            self.original_clip_counts = (0, 0)
+            self.clip_label.setText("clip O(low=0, high=0) → N(low=0, high=0) Δ(low=+0, high=+0)")
             return
+
+        self.original_clip_counts = self._compute_clipped_pixel_counts(self.original_float)
         out = self.original_float.copy()
         for block in self.pipeline:
             if not block.enabled:
                 continue
             definition = self.definitions[block.block_type]
             out = definition.apply_fn(out, block.parameters)
-        low_clipped = int(np.count_nonzero(np.any(out < 0.0, axis=2)))
-        high_clipped = int(np.count_nonzero(np.any(out > 1.0, axis=2)))
-        self.clip_label.setText(f"clipped low={low_clipped}, high={high_clipped}")
+        low_clipped, high_clipped = self._compute_clipped_pixel_counts(out)
+        original_low, original_high = self.original_clip_counts
+        delta_low = low_clipped - original_low
+        delta_high = high_clipped - original_high
+        self.clip_label.setText(
+            "clip "
+            f"O(low={original_low}, high={original_high}) "
+            f"→ N(low={low_clipped}, high={high_clipped}) "
+            f"Δ(low={delta_low:+d}, high={delta_high:+d})"
+        )
         self.rendered_float = np.clip(out, 0.0, 1.0).astype(np.float32)
         self.viewer.set_image(self.rendered_float)
         self.histogram.set_image(self.rendered_float)
         self.update_histogram_levels_overlay()
+
+    @staticmethod
+    def _compute_clipped_pixel_counts(image: np.ndarray) -> tuple[int, int]:
+        low_clipped = int(np.count_nonzero(np.any(image < 0.0, axis=2)))
+        high_clipped = int(np.count_nonzero(np.any(image > 1.0, axis=2)))
+        return low_clipped, high_clipped
 
 
 def run() -> None:
