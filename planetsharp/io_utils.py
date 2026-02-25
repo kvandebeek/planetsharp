@@ -9,8 +9,45 @@ import tifffile
 from PIL import Image
 
 PIPELINE_VERSION = 1
+APP_STATE_VERSION = 1
 SUPPORTED_DTYPES = {np.uint8, np.uint16, np.uint32, np.float32, np.int32}
 IMAGECODECS_REQUIRED_MESSAGE = "requires the 'imagecodecs' package"
+APP_STATE_FILENAME = "app_state.json"
+
+
+def _app_state_path() -> Path:
+    return Path.home() / ".planetsharp" / APP_STATE_FILENAME
+
+
+def load_default_image_folder() -> str:
+    path = _app_state_path()
+    if not path.exists():
+        return ""
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    if payload.get("version") != APP_STATE_VERSION:
+        return ""
+    folder = payload.get("default_image_folder")
+    if not isinstance(folder, str) or not folder:
+        return ""
+    if not Path(folder).is_dir():
+        return ""
+    return folder
+
+
+def save_default_image_folder(folder: str) -> None:
+    folder_path = Path(folder)
+    if not folder_path.is_dir():
+        return
+    target = _app_state_path()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": APP_STATE_VERSION,
+        "default_image_folder": str(folder_path.resolve()),
+    }
+    target.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def _as_rgb(image: np.ndarray) -> np.ndarray:
