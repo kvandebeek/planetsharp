@@ -125,9 +125,11 @@ class MainWindow(QMainWindow):
         self.zoom_out_btn = QPushButton("Zoom -")
         self.zoom_reset_btn = QPushButton("Reset zoom")
         self.pixel_label = QLabel("x=-, y=-, value=-")
+        self.clip_label = QLabel("clipped low=0, high=0")
         for b in [self.zoom_in_btn, self.zoom_out_btn, self.zoom_reset_btn]:
             zoom_row.addWidget(b)
         zoom_row.addWidget(self.pixel_label)
+        zoom_row.addWidget(self.clip_label)
         zoom_row.addStretch(1)
         viewer_layout.addWidget(self.viewer)
         viewer_layout.addLayout(zoom_row)
@@ -137,12 +139,8 @@ class MainWindow(QMainWindow):
         hist_controls = QHBoxLayout()
         self.hist_mode = QComboBox()
         self.hist_mode.addItems(["luminance", "per-channel"])
-        self.hist_scale = QComboBox()
-        self.hist_scale.addItems(["linear", "log"])
         hist_controls.addWidget(QLabel("Mode"))
         hist_controls.addWidget(self.hist_mode)
-        hist_controls.addWidget(QLabel("Scale"))
-        hist_controls.addWidget(self.hist_scale)
         hist_controls.addStretch(1)
         self.histogram = HistogramWidget()
         hist_layout.addLayout(hist_controls)
@@ -221,7 +219,6 @@ class MainWindow(QMainWindow):
         self.reset_btn.clicked.connect(self.reset_selected)
         self.enable_checkbox.toggled.connect(self.toggle_selected_enabled)
         self.hist_mode.currentTextChanged.connect(self.on_hist_mode_changed)
-        self.hist_scale.currentTextChanged.connect(self.on_hist_scale_changed)
 
         screen = QGuiApplication.primaryScreen()
         if screen:
@@ -275,9 +272,6 @@ class MainWindow(QMainWindow):
 
     def on_hist_mode_changed(self, value: str) -> None:
         self.histogram.set_mode("luminance" if value == "luminance" else "per-channel")
-
-    def on_hist_scale_changed(self, value: str) -> None:
-        self.histogram.set_scale(value)
 
     def on_open(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -543,6 +537,7 @@ class MainWindow(QMainWindow):
             self.rendered_float = None
             self.viewer.set_image(None)
             self.histogram.set_image(None)
+            self.clip_label.setText("clipped low=0, high=0")
             return
         out = self.original_float.copy()
         for block in self.pipeline:
@@ -550,6 +545,9 @@ class MainWindow(QMainWindow):
                 continue
             definition = self.definitions[block.block_type]
             out = definition.apply_fn(out, block.parameters)
+        low_clipped = int(np.count_nonzero(np.any(out < 0.0, axis=2)))
+        high_clipped = int(np.count_nonzero(np.any(out > 1.0, axis=2)))
+        self.clip_label.setText(f"clipped low={low_clipped}, high={high_clipped}")
         self.rendered_float = np.clip(out, 0.0, 1.0).astype(np.float32)
         self.viewer.set_image(self.rendered_float)
         self.histogram.set_image(self.rendered_float)
