@@ -23,6 +23,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QProgressBar,
     QSlider,
+    QSpacerItem,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
@@ -408,9 +410,20 @@ class MainWindow(QMainWindow):
                     continue
             visible_specs.append(spec)
 
-        for idx, spec in enumerate(visible_specs):
+        row_index = 0
+        for spec in visible_specs:
+            if spec.key == "shadow_upper":
+                self.adjust_form.addItem(
+                    QSpacerItem(0, 14, QSizePolicy.Policy.Minimum, QSizePolicy.Policy.Fixed),
+                    row_index,
+                    0,
+                    1,
+                    3,
+                )
+                row_index += 1
+
             label = QLabel(spec.label)
-            self.adjust_form.addWidget(label, idx, 0)
+            self.adjust_form.addWidget(label, row_index, 0)
 
             if spec.input_type == "choice":
                 dropdown = QComboBox()
@@ -430,8 +443,9 @@ class MainWindow(QMainWindow):
                     return handler
 
                 dropdown.currentTextChanged.connect(make_choice_handler())
-                self.adjust_form.addWidget(dropdown, idx, 1)
-                self.adjust_form.addWidget(QLabel(current), idx, 2)
+                self.adjust_form.addWidget(dropdown, row_index, 1)
+                self.adjust_form.addWidget(QLabel(current), row_index, 2)
+                row_index += 1
                 continue
 
             slider = QSlider(Qt.Orientation.Horizontal)
@@ -453,8 +467,9 @@ class MainWindow(QMainWindow):
                 return handler
 
             slider.valueChanged.connect(make_handler())
-            self.adjust_form.addWidget(slider, idx, 1)
-            self.adjust_form.addWidget(value_label, idx, 2)
+            self.adjust_form.addWidget(slider, row_index, 1)
+            self.adjust_form.addWidget(value_label, row_index, 2)
+            row_index += 1
 
     def remove_selected(self) -> None:
         row = self.pipeline_list.currentRow()
