@@ -18,6 +18,7 @@ class ImageViewer(QGraphicsView):
         self._pixmap_item = QGraphicsPixmapItem()
         self._scene.addItem(self._pixmap_item)
         self._current_float: np.ndarray | None = None
+        self._display_buffer: np.ndarray | None = None
         self._zoom = 1.0
         self._panning = False
         self._pan_start = QPoint()
@@ -31,13 +32,14 @@ class ImageViewer(QGraphicsView):
     def set_image(self, image_float: np.ndarray | None) -> None:
         self._current_float = image_float
         if image_float is None:
+            self._display_buffer = None
             self._pixmap_item.setPixmap(QPixmap())
             return
-        rgb8 = np.clip(image_float * 255.0, 0, 255).astype(np.uint8)
-        h, w, _ = rgb8.shape
-        qimg = QImage(rgb8.data, w, h, 3 * w, QImage.Format.Format_RGB888)
-        pixmap = QPixmap.fromImage(qimg.copy())
-        self._pixmap_item.setPixmap(pixmap)
+
+        self._display_buffer = np.clip(image_float * 255.0, 0, 255).astype(np.uint8, copy=False)
+        h, w, _ = self._display_buffer.shape
+        qimg = QImage(self._display_buffer.data, w, h, 3 * w, QImage.Format.Format_RGB888)
+        self._pixmap_item.setPixmap(QPixmap.fromImage(qimg))
         self._scene.setSceneRect(0, 0, w, h)
         if self._zoom == 1.0:
             self.fitInView(self._scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
@@ -100,17 +102,23 @@ class HistogramWidget(QWidget):
         self._mode = "luminance"
         self._scale = "linear"
         self._levels_overlay: dict[str, dict[str, float]] | None = None
+        self._hist_cache: dict[str, list[np.ndarray]] = {}
         self.setMinimumHeight(180)
 
     def set_image(self, image_float: np.ndarray | None) -> None:
         self._image = image_float
+        self._hist_cache.clear()
         self.update()
 
     def set_mode(self, mode: str) -> None:
+        if mode == self._mode:
+            return
         self._mode = mode
         self.update()
 
     def set_scale(self, scale: str) -> None:
+        if scale == self._scale:
+            return
         self._scale = scale
         self.update()
 
@@ -121,14 +129,23 @@ class HistogramWidget(QWidget):
     def _compute_hist(self) -> list[np.ndarray]:
         if self._image is None:
             return []
+
+        cached = self._hist_cache.get(self._mode)
+        if cached is not None:
+            return cached
+
         if self._mode == "luminance":
             lum = 0.2126 * self._image[..., 0] + 0.7152 * self._image[..., 1] + 0.0722 * self._image[..., 2]
             hist, _ = np.histogram(np.clip(lum, 0.0, 1.0), bins=256, range=(0.0, 1.0))
-            return [hist.astype(np.float32)]
+            result = [hist.astype(np.float32)]
+            self._hist_cache[self._mode] = result
+            return result
+
         chans = []
         for c in range(3):
             hist, _ = np.histogram(np.clip(self._image[..., c], 0.0, 1.0), bins=256, range=(0.0, 1.0))
             chans.append(hist.astype(np.float32))
+        self._hist_cache[self._mode] = chans
         return chans
 
     def paintEvent(self, _event) -> None:

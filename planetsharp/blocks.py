@@ -254,14 +254,8 @@ def _convolve_axis(image: np.ndarray, kernel: np.ndarray, axis: int) -> np.ndarr
     pad_width = [(0, 0)] * image.ndim
     pad_width[axis] = (radius, radius)
     padded = np.pad(image, pad_width, mode="reflect")
-
-    result = np.zeros_like(image)
-    for idx, weight in enumerate(kernel):
-        shift = idx
-        slicer = [slice(None)] * image.ndim
-        slicer[axis] = slice(shift, shift + image.shape[axis])
-        result += padded[tuple(slicer)] * weight
-    return result
+    windows = np.lib.stride_tricks.sliding_window_view(padded, window_shape=len(kernel), axis=axis)
+    return np.tensordot(windows, kernel.astype(np.float32), axes=([-1], [0])).astype(np.float32)
 
 
 def _srgb_to_linear(image: np.ndarray) -> np.ndarray:
