@@ -273,23 +273,44 @@ class MainWindow(QMainWindow):
         definition = self.definitions[block.block_type]
         for idx, spec in enumerate(definition.parameters):
             label = QLabel(spec.label)
+            self.adjust_form.addWidget(label, idx, 0)
+
+            if spec.input_type == "choice":
+                dropdown = QComboBox()
+                dropdown.addItems(spec.choices)
+                current = str(block.parameters[spec.key])
+                if current not in spec.choices:
+                    current = str(spec.default)
+                    block.parameters[spec.key] = current
+                dropdown.setCurrentText(current)
+
+                def make_choice_handler(b=block, s=spec):
+                    def handler(value: str) -> None:
+                        b.parameters[s.key] = value
+                        self.apply_pipeline()
+                    return handler
+
+                dropdown.currentTextChanged.connect(make_choice_handler())
+                self.adjust_form.addWidget(dropdown, idx, 1)
+                self.adjust_form.addWidget(QLabel(current), idx, 2)
+                continue
+
             slider = QSlider(Qt.Orientation.Horizontal)
             slider.setMinimum(0)
             steps = int(round((spec.max_value - spec.min_value) / spec.step))
             slider.setMaximum(steps)
-            current = block.parameters[spec.key]
+            current = float(block.parameters[spec.key])
             slider.setValue(int(round((current - spec.min_value) / spec.step)))
             value_label = QLabel(f"{current:.2f}")
 
-            def make_handler(b=block, s=spec, sl=slider, vl=value_label):
+            def make_handler(b=block, s=spec, vl=value_label):
                 def handler(value: int) -> None:
                     b.parameters[s.key] = s.min_value + value * s.step
-                    vl.setText(f"{b.parameters[s.key]:.2f}")
+                    vl.setText(f"{float(b.parameters[s.key]):.2f}")
                     self.apply_pipeline()
                 return handler
 
             slider.valueChanged.connect(make_handler())
-            self.adjust_form.addWidget(label, idx, 0)
             self.adjust_form.addWidget(slider, idx, 1)
             self.adjust_form.addWidget(value_label, idx, 2)
 
