@@ -44,6 +44,7 @@ from .io_utils import (
     save_image_16bit,
     save_pipeline,
 )
+from .perf import PerfMonitor
 from .widgets import HistogramWidget, ImageViewer
 
 DARK_STYLE = """
@@ -79,6 +80,7 @@ class MainWindow(QMainWindow):
         self._pipeline_apply_timer = QTimer(self)
         self._pipeline_apply_timer.setSingleShot(True)
         self._pipeline_apply_timer.timeout.connect(self._apply_pipeline_now)
+        self.perf = PerfMonitor.from_env()
 
         central = QWidget()
         root = QVBoxLayout(central)
@@ -280,6 +282,7 @@ class MainWindow(QMainWindow):
             return
         try:
             self.original_native, self.original_float = load_image(path)
+            self.original_clip_counts = self._compute_clipped_pixel_counts(self.original_float)
             self._remember_image_folder(path)
             self.apply_pipeline()
             self.viewer.reset_zoom()
@@ -529,35 +532,45 @@ class MainWindow(QMainWindow):
         self._pipeline_apply_timer.start(0)
 
     def _apply_pipeline_now(self) -> None:
-        if self.original_float is None:
-            self.rendered_float = None
-            self.viewer.set_image(None)
-            self.histogram.set_image(None)
-            self.original_clip_counts = (0, 0)
-            self.clip_label.setText("clip O(low=0, high=0) → N(low=0, high=0) Δ(low=+0, high=+0)")
-            return
+        with self.perf.track("frame.total"):
+            if self.original_float is None:
+                self.rendered_float = None
+                self.viewer.set_image(None)
+                self.histogram.set_image(None)
+                self.original_clip_counts = (0, 0)
+                self.clip_label.setText("clip O(low=0, high=0) → N(low=0, high=0) Δ(low=+0, high=+0)")
+                return
 
-        self.original_clip_counts = self._compute_clipped_pixel_counts(self.original_float)
-        out = self.original_float.copy()
-        for block in self.pipeline:
-            if not block.enabled:
-                continue
-            definition = self.definitions[block.block_type]
-            out = definition.apply_fn(out, block.parameters)
-        low_clipped, high_clipped = self._compute_clipped_pixel_counts(out)
-        original_low, original_high = self.original_clip_counts
-        delta_low = low_clipped - original_low
-        delta_high = high_clipped - original_high
-        self.clip_label.setText(
-            "clip "
-            f"O(low={original_low}, high={original_high}) "
-            f"→ N(low={low_clipped}, high={high_clipped}) "
-            f"Δ(low={delta_low:+d}, high={delta_high:+d})"
-        )
-        self.rendered_float = np.clip(out, 0.0, 1.0).astype(np.float32)
-        self.viewer.set_image(self.rendered_float)
-        self.histogram.set_image(self.rendered_float)
-        self.update_histogram_levels_overlay()
+            with self.perf.track("frame.copy"):
+                out = self.original_float.copy()
+
+            for block in self.pipeline:
+                if not block.enabled:
+                    continue
+                definition = self.definitions[block.block_type]
+                with self.perf.track(f"block.{block.block_type}"):
+                    out = definition.apply_fn(out, block.parameters)
+
+            with self.perf.track("frame.clipping_stats"):
+                low_clipped, high_clipped = self._compute_clipped_pixel_counts(out)
+            original_low, original_high = self.original_clip_counts
+            delta_low = low_clipped - original_low
+            delta_high = high_clipped - original_high
+            self.clip_label.setText(
+                "clip "
+                f"O(low={original_low}, high={original_high}) "
+                f"→ N(low={low_clipped}, high={high_clipped}) "
+                f"Δ(low={delta_low:+d}, high={delta_high:+d})"
+            )
+
+            with self.perf.track("frame.final_clip"):
+                self.rendered_float = np.clip(out, 0.0, 1.0).astype(np.float32)
+            with self.perf.track("frame.viewer"):
+                self.viewer.set_image(self.rendered_float)
+            with self.perf.track("frame.histogram"):
+                self.histogram.set_image(self.rendered_float)
+            self.update_histogram_levels_overlay()
+        self.perf.end_frame()
 
     @staticmethod
     def _compute_clipped_pixel_counts(image: np.ndarray) -> tuple[int, int]:
