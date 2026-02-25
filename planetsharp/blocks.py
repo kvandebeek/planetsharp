@@ -61,6 +61,13 @@ def apply_saturation(image: np.ndarray, params: dict[str, float | str]) -> np.nd
     return _clip01(luminance + (image - luminance) * saturation)
 
 
+def apply_midtone_transfer(image: np.ndarray, params: dict[str, float | str]) -> np.ndarray:
+    transfer = float(np.clip(float(params["midtone_transfer"]), 0.0, 1.0))
+    centered = (transfer - 0.5) * 2.0  # -1.0 to 1.0, neutral at 0.5
+    gamma = 1.0 - (centered * 0.15)  # gentle range: 0.85 to 1.15
+    return _clip01(np.power(_clip01(image), gamma))
+
+
 def _gaussian_kernel_1d(size: int, strength: float) -> np.ndarray:
     size = max(1, int(size))
     if size % 2 == 0:
@@ -212,6 +219,21 @@ def block_definitions() -> dict[str, BlockDefinition]:
             label="Saturation",
             parameters=[ParameterSpec("saturation", "Saturation", 0.0, 3.0, 0.01, 1.0)],
             apply_fn=apply_saturation,
+        ),
+        "midtone_transfer": BlockDefinition(
+            block_type="midtone_transfer",
+            label="Midtone transfer",
+            parameters=[
+                ParameterSpec(
+                    "midtone_transfer",
+                    "Midtone transfer",
+                    0.0,
+                    1.0,
+                    0.01,
+                    0.5,
+                )
+            ],
+            apply_fn=apply_midtone_transfer,
         ),
         "gaussian_blur": BlockDefinition(
             block_type="gaussian_blur",

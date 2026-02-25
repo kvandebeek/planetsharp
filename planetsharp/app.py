@@ -143,7 +143,7 @@ class MainWindow(QMainWindow):
         library_frame = QFrame()
         library_layout = QVBoxLayout(library_frame)
         library_layout.addWidget(QLabel("Block library"))
-        for key in ["brightness", "contrast", "saturation", "gaussian_blur"]:
+        for key in ["brightness", "contrast", "saturation", "midtone_transfer", "gaussian_blur"]:
             row = QHBoxLayout()
             row.addWidget(QLabel(self.definitions[key].label))
             btn = QPushButton("->")
