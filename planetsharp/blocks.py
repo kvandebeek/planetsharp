@@ -154,6 +154,8 @@ def apply_gaussian_blur(image: np.ndarray, params: dict[str, float | str]) -> np
     size = float(params["size"])
     strength = float(params["strength"])
     channel_mode = str(params.get("channel_mode", "All channels"))
+    lab_balance = float(params.get("lab_balance", 0.0))
+    lab_balance = float(np.clip(lab_balance, 0.0, 1.0))
     if size <= 0.0 or strength <= 0.0:
         return image
 
@@ -166,12 +168,26 @@ def apply_gaussian_blur(image: np.ndarray, params: dict[str, float | str]) -> np
 
     if channel_mode == "Luminance only (LAB L)":
         lab = _rgb_to_lab(image)
-        lab[..., 0:1] = blur_channels(lab[..., 0:1])
-        return _lab_to_rgb(lab)
+        l_blur = lab.copy()
+        l_blur[..., 0:1] = blur_channels(l_blur[..., 0:1])
+        if lab_balance <= 0.0:
+            return _lab_to_rgb(l_blur)
+
+        ab_blur = lab.copy()
+        ab_blur[..., 1:3] = blur_channels(ab_blur[..., 1:3])
+        blended = (1.0 - lab_balance) * l_blur + lab_balance * ab_blur
+        return _lab_to_rgb(blended)
     if channel_mode == "A/B only (LAB chroma)":
         lab = _rgb_to_lab(image)
-        lab[..., 1:3] = blur_channels(lab[..., 1:3])
-        return _lab_to_rgb(lab)
+        ab_blur = lab.copy()
+        ab_blur[..., 1:3] = blur_channels(ab_blur[..., 1:3])
+        if lab_balance <= 0.0:
+            return _lab_to_rgb(ab_blur)
+
+        l_blur = lab.copy()
+        l_blur[..., 0:1] = blur_channels(l_blur[..., 0:1])
+        blended = (1.0 - lab_balance) * ab_blur + lab_balance * l_blur
+        return _lab_to_rgb(blended)
 
     blurred = blur_channels(image)
     return _clip01(blurred)
@@ -201,7 +217,7 @@ def block_definitions() -> dict[str, BlockDefinition]:
             block_type="gaussian_blur",
             label="Gaussian blur",
             parameters=[
-                ParameterSpec("size", "Blur size (px)", 0.0, 5.0, 0.05, 0.0),
+                ParameterSpec("size", "Blur size (px)", 0.0, 8.0, 0.05, 0.0),
                 ParameterSpec("strength", "Blur strength", 0.0, 1.0, 0.05, 0.0),
                 ParameterSpec(
                     "channel_mode",
@@ -213,6 +229,7 @@ def block_definitions() -> dict[str, BlockDefinition]:
                     input_type="choice",
                     choices=["All channels", "Luminance only (LAB L)", "A/B only (LAB chroma)"],
                 ),
+                ParameterSpec("lab_balance", "L/AB balance", 0.0, 1.0, 0.01, 0.0),
             ],
             apply_fn=apply_gaussian_blur,
         ),

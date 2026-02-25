@@ -339,7 +339,15 @@ class MainWindow(QMainWindow):
         self.enable_checkbox.blockSignals(False)
 
         definition = self.definitions[block.block_type]
-        for idx, spec in enumerate(definition.parameters):
+        visible_specs = []
+        for spec in definition.parameters:
+            if spec.key == "lab_balance":
+                mode = str(block.parameters.get("channel_mode", "All channels"))
+                if mode == "All channels":
+                    continue
+            visible_specs.append(spec)
+
+        for idx, spec in enumerate(visible_specs):
             label = QLabel(spec.label)
             self.adjust_form.addWidget(label, idx, 0)
 
@@ -352,9 +360,11 @@ class MainWindow(QMainWindow):
                     block.parameters[spec.key] = current
                 dropdown.setCurrentText(current)
 
-                def make_choice_handler(b=block, s=spec):
+                def make_choice_handler(b=block, s=spec, selected_row=row):
                     def handler(value: str) -> None:
                         b.parameters[s.key] = value
+                        if b.block_type == "gaussian_blur" and s.key == "channel_mode":
+                            self.rebuild_adjustment_panel(selected_row)
                         self.apply_pipeline()
                     return handler
 
