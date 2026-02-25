@@ -12,3 +12,15 @@ A PySide6-based planetary image editor with a block pipeline and realtime render
    ```bash
    python3 main.py
    ```
+
+## Performance profiling
+
+- Enable live per-frame/per-block timing logs:
+  ```bash
+  PLANETSHARP_PROFILE=1 PLANETSHARP_PROFILE_EVERY=10 python3 main.py
+  ```
+- Run synthetic benchmark to identify hotspot blocks:
+  ```bash
+  python3 scripts/profile_pipeline.py --width 1920 --height 1080 --runs 15
+  ```
+- Deep analysis report: `docs/performance_analysis.md`.

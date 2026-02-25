@@ -5,6 +5,24 @@ from typing import Any, Callable, Literal
 
 import numpy as np
 
+_RGB_TO_XYZ = np.array(
+    [
+        [0.4124564, 0.3575761, 0.1804375],
+        [0.2126729, 0.7151522, 0.0721750],
+        [0.0193339, 0.1191920, 0.9503041],
+    ],
+    dtype=np.float32,
+)
+_XYZ_TO_RGB = np.array(
+    [
+        [3.2404542, -1.5371385, -0.4985314],
+        [-0.9692660, 1.8760108, 0.0415560],
+        [0.0556434, -0.2040259, 1.0572252],
+    ],
+    dtype=np.float32,
+)
+_WHITE_POINT = np.array([0.95047, 1.0, 1.08883], dtype=np.float32)
+_GAUSSIAN_KERNEL_CACHE: dict[tuple[int, int], np.ndarray] = {}
 
 @dataclass
 class ParameterSpec:
@@ -241,21 +259,39 @@ def _gaussian_kernel_1d(size: int, strength: float) -> np.ndarray:
     size = max(1, int(size))
     if size % 2 == 0:
         size += 1
+
+    # Cache by odd kernel size + quantized strength to reduce repeated kernel rebuilds.
+    key = (size, int(round(float(strength) * 1000.0)))
+    cached = _GAUSSIAN_KERNEL_CACHE.get(key)
+    if cached is not None:
+        return cached
+
     radius = size // 2
-    sigma = max(0.01, strength * max(1.0, radius))
+    sigma = max(0.01, float(strength) * max(1.0, radius))
     x = np.arange(-radius, radius + 1, dtype=np.float32)
-    kernel = np.exp(-(x * x) / (2.0 * sigma * sigma))
+    kernel = np.exp(-(x * x) / (2.0 * sigma * sigma)).astype(np.float32)
     kernel /= np.sum(kernel)
+    _GAUSSIAN_KERNEL_CACHE[key] = kernel
     return kernel
 
 
 def _convolve_axis(image: np.ndarray, kernel: np.ndarray, axis: int) -> np.ndarray:
-    radius = len(kernel) // 2
+    kernel32 = kernel.astype(np.float32, copy=False)
+    radius = len(kernel32) // 2
     pad_width = [(0, 0)] * image.ndim
     pad_width[axis] = (radius, radius)
-    padded = np.pad(image, pad_width, mode="reflect")
-    windows = np.lib.stride_tricks.sliding_window_view(padded, window_shape=len(kernel), axis=axis)
-    return np.tensordot(windows, kernel.astype(np.float32), axes=([-1], [0])).astype(np.float32)
+    padded = np.pad(image.astype(np.float32, copy=False), pad_width, mode="reflect")
+
+    out = np.zeros_like(image, dtype=np.float32)
+    slices: list[slice | None] = [slice(None)] * image.ndim
+    for idx, weight in enumerate(kernel32):
+        if abs(float(weight)) < 1e-8:
+            continue
+        start = idx
+        end = start + image.shape[axis]
+        slices[axis] = slice(start, end)
+        out += float(weight) * padded[tuple(slices)]
+    return out
 
 
 def _srgb_to_linear(image: np.ndarray) -> np.ndarray:
@@ -268,17 +304,8 @@ def _linear_to_srgb(image: np.ndarray) -> np.ndarray:
 
 def _rgb_to_lab(image: np.ndarray) -> np.ndarray:
     linear = _srgb_to_linear(_clip01(image)).astype(np.float32)
-    matrix = np.array(
-        [
-            [0.4124564, 0.3575761, 0.1804375],
-            [0.2126729, 0.7151522, 0.0721750],
-            [0.0193339, 0.1191920, 0.9503041],
-        ],
-        dtype=np.float32,
-    )
-    xyz = linear @ matrix.T
-    white = np.array([0.95047, 1.0, 1.08883], dtype=np.float32)
-    xyz_scaled = xyz / white
+    xyz = linear @ _RGB_TO_XYZ.T
+    xyz_scaled = xyz / _WHITE_POINT
 
     delta = 6.0 / 29.0
     def f(t: np.ndarray) -> np.ndarray:
@@ -307,15 +334,7 @@ def _lab_to_rgb(lab: np.ndarray) -> np.ndarray:
     y = finv(fy) * 1.0
     z = finv(fz) * 1.08883
     xyz = np.stack([x, y, z], axis=-1)
-    inv_matrix = np.array(
-        [
-            [3.2404542, -1.5371385, -0.4985314],
-            [-0.9692660, 1.8760108, 0.0415560],
-            [0.0556434, -0.2040259, 1.0572252],
-        ],
-        dtype=np.float32,
-    )
-    linear = xyz @ inv_matrix.T
+    linear = xyz @ _XYZ_TO_RGB.T
     srgb = _linear_to_srgb(np.clip(linear, 0.0, 1.0))
     return _clip01(srgb.astype(np.float32))
 

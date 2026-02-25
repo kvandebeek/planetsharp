@@ -179,16 +179,18 @@ class HistogramWidget(QWidget):
         if height <= 1:
             return
         painter.setClipRect(0, top, width, height)
+        y_base = top + height - 1
+        x_positions = np.linspace(0, width - 1, 256).astype(np.int32)
         for hist, color in zip(hists, colors):
-            values = np.log1p(hist) if scale == "log" else hist.copy()
-            maxv = np.max(values) if np.max(values) > 0 else 1.0
+            values = np.log1p(hist) if scale == "log" else hist
+            maxv = float(np.max(values))
+            if maxv <= 0.0:
+                maxv = 1.0
             norm = values / maxv
             painter.setPen(QPen(color, 1))
-            for x in range(256):
-                px = int((x / 255.0) * (width - 1))
+            for x, px in enumerate(x_positions):
                 bar_h = int(norm[x] * (height - 1))
-                y_base = top + height - 1
-                painter.drawLine(px, y_base, px, y_base - bar_h)
+                painter.drawLine(int(px), y_base, int(px), y_base - bar_h)
         painter.setClipping(False)
 
     def _paint_levels_overlay(self, painter: QPainter, width: int, height: int, top: int = 0) -> None:
