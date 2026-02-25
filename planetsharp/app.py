@@ -4,6 +4,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import psutil
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
@@ -20,6 +21,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QProgressBar,
     QSlider,
     QVBoxLayout,
     QWidget,
@@ -76,6 +78,26 @@ class MainWindow(QMainWindow):
         for b in [self.open_btn, self.save_btn, self.save_pipeline_btn, self.load_pipeline_btn]:
             top_row.addWidget(b)
         top_row.addStretch(1)
+
+        stats_layout = QHBoxLayout()
+        stats_layout.setSpacing(12)
+        self.cpu_label = QLabel("CPU 0.0%")
+        self.cpu_bar = QProgressBar()
+        self.cpu_bar.setRange(0, 100)
+        self.cpu_bar.setTextVisible(False)
+        self.cpu_bar.setFixedWidth(140)
+
+        self.mem_label = QLabel("MEM 0.00 / 0.00 GB")
+        self.mem_bar = QProgressBar()
+        self.mem_bar.setRange(0, 100)
+        self.mem_bar.setTextVisible(False)
+        self.mem_bar.setFixedWidth(140)
+
+        stats_layout.addWidget(self.cpu_label)
+        stats_layout.addWidget(self.cpu_bar)
+        stats_layout.addWidget(self.mem_label)
+        stats_layout.addWidget(self.mem_bar)
+        top_row.addLayout(stats_layout)
         root.addLayout(top_row)
 
         # Row 2: Viewer + histogram
@@ -178,6 +200,52 @@ class MainWindow(QMainWindow):
         screen = QGuiApplication.primaryScreen()
         if screen:
             self.setGeometry(screen.availableGeometry())
+
+        self._init_resource_timer()
+
+    def _init_resource_timer(self) -> None:
+        self.resource_timer = self.startTimer(1000)
+        psutil.cpu_percent(interval=None)
+        self._refresh_resource_usage()
+
+    def timerEvent(self, event) -> None:  # type: ignore[override]
+        if event.timerId() == self.resource_timer:
+            self._refresh_resource_usage()
+            return
+        super().timerEvent(event)
+
+    def _refresh_resource_usage(self) -> None:
+        cpu_percent = psutil.cpu_percent(interval=None)
+        mem = psutil.virtual_memory()
+        mem_total_gb = mem.total / (1024**3)
+        mem_used_gb = mem.used / (1024**3)
+        mem_percent = mem.percent
+
+        self.cpu_label.setText(f"CPU {cpu_percent:.1f}%")
+        self.cpu_bar.setValue(int(round(cpu_percent)))
+        self._set_usage_color(self.cpu_bar, cpu_percent)
+
+        self.mem_label.setText(f"MEM {mem_used_gb:.2f} / {mem_total_gb:.2f} GB")
+        self.mem_bar.setValue(int(round(mem_percent)))
+        self._set_usage_color(self.mem_bar, mem_percent)
+
+    def _set_usage_color(self, bar: QProgressBar, value: float) -> None:
+        if value < 60:
+            color = "#2E7D32"  # green
+        elif value < 85:
+            color = "#F9A825"  # orange
+        else:
+            color = "#C62828"  # red
+        bar.setStyleSheet(
+            "QProgressBar {"
+            " border: 1px solid #3A3A3A;"
+            " border-radius: 3px;"
+            " background-color: #1D1D1D;"
+            "}"
+            "QProgressBar::chunk {"
+            f" background-color: {color};"
+            "}"
+        )
 
     def on_hist_mode_changed(self, value: str) -> None:
         self.histogram.set_mode("luminance" if value == "luminance" else "per-channel")

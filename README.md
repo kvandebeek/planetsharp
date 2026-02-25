@@ -6,7 +6,7 @@ A PySide6-based planetary image editor with a block pipeline and realtime render
 
 1. Install dependencies:
    ```bash
-   pip install PySide6 numpy pillow tifffile
+   pip install PySide6 numpy pillow tifffile psutil
    ```
 2. Start the app from project root:
    ```bash
