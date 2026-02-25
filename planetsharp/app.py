@@ -561,8 +561,8 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _compute_clipped_pixel_counts(image: np.ndarray) -> tuple[int, int]:
-        low_clipped = int(np.count_nonzero(np.any(image < 0.0, axis=2)))
-        high_clipped = int(np.count_nonzero(np.any(image > 1.0, axis=2)))
+        low_clipped = int(np.count_nonzero(np.any(image <= 0.0, axis=2)))
+        high_clipped = int(np.count_nonzero(np.any(image >= 1.0, axis=2)))
         return low_clipped, high_clipped
 
 
