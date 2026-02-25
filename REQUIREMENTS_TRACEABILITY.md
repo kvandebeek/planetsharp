@@ -23,7 +23,7 @@ Status legend: ✅ Implemented
 | REQ7 | ✅ | `planetsharp/app.py::MainWindow.__init__` 3 major rows |
 | REQ8 | ✅ | `planetsharp/app.py` top row layout first |
 | REQ9 | ✅ | `planetsharp/app.py` Open/Save/Save pipeline buttons |
-| REQ10 | ✅ | `planetsharp/io_utils.py::load_image` ext + dtype validation |
+| REQ10 | ✅ | `planetsharp/io_utils.py::load_image` ext + 8/16/32-bit dtype validation |
 | REQ11 | ✅ | `planetsharp/io_utils.py::save_image_16bit` always writes `uint16` |
 | REQ12 | ✅ | `planetsharp/app.py::on_save_pipeline`, `io_utils.py::save_pipeline` |
 | REQ13 | ✅ | `planetsharp/app.py::on_open -> apply_pipeline -> viewer.set_image` |

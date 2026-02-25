@@ -9,7 +9,7 @@ import tifffile
 from PIL import Image
 
 PIPELINE_VERSION = 1
-SUPPORTED_DTYPES = {np.uint16, np.uint32, np.float32, np.int32}
+SUPPORTED_DTYPES = {np.uint8, np.uint16, np.uint32, np.float32, np.int32}
 
 
 def _as_rgb(image: np.ndarray) -> np.ndarray:
@@ -34,7 +34,7 @@ def load_image(path: str) -> tuple[np.ndarray, np.ndarray]:
         arr = tifffile.imread(path)
 
     if arr.dtype.type not in SUPPORTED_DTYPES:
-        raise ValueError("Only 16-bit or 32-bit images are supported.")
+        raise ValueError("Only 8-bit, 16-bit, or 32-bit images are supported.")
 
     arr = _as_rgb(arr)
 

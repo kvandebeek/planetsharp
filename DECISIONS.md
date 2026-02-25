@@ -9,7 +9,7 @@
    - Used Qt window flags: `WindowTitleHint + WindowCloseButtonHint + CustomizeWindowHint` to keep close and suppress minimize/maximize.
 
 3. **16/32-bit validation for PNG/TIF (REQ10)**
-   - Accepted dtypes: `uint16`, `uint32`, `int32`, `float32`.
+   - Accepted dtypes: `uint8`, `uint16`, `uint32`, `int32`, `float32`.
    - Rejected all others with explicit message.
 
 4. **Internal format**
