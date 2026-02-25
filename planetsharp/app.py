@@ -6,7 +6,6 @@ from pathlib import Path
 import numpy as np
 import psutil
 from PySide6.QtCore import QTimer, Qt
-from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -220,10 +219,6 @@ class MainWindow(QMainWindow):
         self.reset_btn.clicked.connect(self.reset_selected)
         self.enable_checkbox.toggled.connect(self.toggle_selected_enabled)
         self.hist_mode.currentTextChanged.connect(self.on_hist_mode_changed)
-
-        screen = QGuiApplication.primaryScreen()
-        if screen:
-            self.setGeometry(screen.availableGeometry())
 
         self._init_resource_timer()
 
@@ -574,5 +569,5 @@ class MainWindow(QMainWindow):
 def run() -> None:
     app = QApplication(sys.argv)
     window = MainWindow()
-    window.show()
+    window.showMaximized()
     sys.exit(app.exec())
