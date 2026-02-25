@@ -42,13 +42,11 @@ def _clip01(image: np.ndarray) -> np.ndarray:
     return np.clip(image, 0.0, 1.0)
 
 
-def apply_brightness(image: np.ndarray, params: dict[str, float | str]) -> np.ndarray:
-    return _clip01(image + float(params["brightness"]))
-
-
-def apply_contrast(image: np.ndarray, params: dict[str, float | str]) -> np.ndarray:
-    factor = float(params["contrast"])
-    return _clip01((image - 0.5) * factor + 0.5)
+def apply_brightness_contrast(image: np.ndarray, params: dict[str, float | str]) -> np.ndarray:
+    brightness = float(params.get("brightness", 0.0))
+    contrast = float(params.get("contrast", 1.0))
+    shifted = image + brightness
+    return _clip01((shifted - 0.5) * contrast + 0.5)
 
 
 def apply_hue_shift(image: np.ndarray, params: dict[str, float | str]) -> np.ndarray:
@@ -138,6 +136,10 @@ def apply_midtone_transfer(image: np.ndarray, params: dict[str, float | str]) ->
     centered = (transfer - 0.5) * 2.0  # -1.0 to 1.0, neutral at 0.5
     gamma = 1.0 - (centered * 0.15)  # gentle range: 0.85 to 1.15
     return _clip01(np.power(_clip01(image), gamma))
+
+
+def apply_levels_midtone_transfer(image: np.ndarray, params: dict[str, float | str]) -> np.ndarray:
+    return apply_levels(apply_midtone_transfer(image, params), params)
 
 
 def _smoothstep(edge0: float, edge1: float, x: np.ndarray) -> np.ndarray:
@@ -457,6 +459,134 @@ def apply_rl_deconvolution(image: np.ndarray, params: dict[str, float | str]) ->
     return _clip01(estimate)
 
 
+def _atrous_blur(image: np.ndarray, step: int, mode: str) -> np.ndarray:
+    weights = np.array([1, 4, 6, 4, 1], dtype=np.float32)
+    if mode == "bspline":
+        weights = np.array([1, 3, 8, 3, 1], dtype=np.float32)
+    kernel = weights / np.sum(weights)
+    if step <= 1:
+        return _convolve_axis(_convolve_axis(image, kernel, axis=1), kernel, axis=0)
+
+    radius = 2 * step
+    sparse = np.zeros(radius * 2 + 1, dtype=np.float32)
+    sparse[0] = kernel[0]
+    sparse[step] = kernel[1]
+    sparse[2 * step] = kernel[2]
+    sparse[3 * step] = kernel[3]
+    sparse[4 * step] = kernel[4]
+    return _convolve_axis(_convolve_axis(image, sparse, axis=1), sparse, axis=0)
+
+
+def apply_wavelet_sharpening(image: np.ndarray, params: dict[str, float | str]) -> np.ndarray:
+    mode = str(params.get("wavelet_mode", "linear"))
+    if mode not in {"linear", "bspline"}:
+        mode = "linear"
+
+    layer_amounts = [
+        float(params.get("layer1_amount", 0.0)),
+        float(params.get("layer2_amount", 0.0)),
+        float(params.get("layer3_amount", 0.0)),
+    ]
+    layer_noise = [
+        float(np.clip(float(params.get("layer1_noise_reduction", 0.0)), 0.0, 1.0)),
+        float(np.clip(float(params.get("layer2_noise_reduction", 0.0)), 0.0, 1.0)),
+        float(np.clip(float(params.get("layer3_noise_reduction", 0.0)), 0.0, 1.0)),
+    ]
+    recovery = float(params.get("recovery_amount", 0.0))
+
+    if all(abs(amount) < 1e-6 for amount in layer_amounts) and recovery <= 0.0:
+        return image
+
+    base = _clip01(image.astype(np.float32))
+    current = base
+    detail_layers: list[np.ndarray] = []
+    for level in range(3):
+        smooth = _atrous_blur(current, step=2**level, mode=mode)
+        detail_layers.append(current - smooth)
+        current = smooth
+
+    sharpened = base.copy()
+    for amount, noise_reduction, detail in zip(layer_amounts, layer_noise, detail_layers):
+        reduced = detail * (1.0 - noise_reduction)
+        sharpened += reduced * amount
+
+    if recovery > 0.0:
+        recovery_blur = _atrous_blur(base, step=4, mode=mode)
+        sharpened = (1.0 - recovery) * sharpened + recovery * recovery_blur
+
+    return _clip01(sharpened)
+
+
+def _make_psf(psf_size: int, seeing_index: float, psf_strength: float) -> np.ndarray:
+    psf_size = max(3, int(psf_size))
+    if psf_size % 2 == 0:
+        psf_size += 1
+    radius = psf_size // 2
+    y, x = np.mgrid[-radius : radius + 1, -radius : radius + 1]
+    sigma = max(0.3, seeing_index)
+    gaussian = np.exp(-((x * x + y * y) / (2.0 * sigma * sigma))).astype(np.float32)
+    halo_sigma = max(0.5, sigma * 1.8)
+    halo = np.exp(-((x * x + y * y) / (2.0 * halo_sigma * halo_sigma))).astype(np.float32)
+    blend = float(np.clip(psf_strength, 0.0, 1.0))
+    psf = (1.0 - blend) * gaussian + blend * halo
+    psf /= np.sum(psf)
+    return psf.astype(np.float32)
+
+
+def _fft_deconvolve(channel: np.ndarray, psf: np.ndarray, strength: float) -> np.ndarray:
+    h, w = channel.shape
+    psf_pad = np.zeros((h, w), dtype=np.float32)
+    ph, pw = psf.shape
+    psf_pad[:ph, :pw] = psf
+    psf_pad = np.roll(psf_pad, -ph // 2, axis=0)
+    psf_pad = np.roll(psf_pad, -pw // 2, axis=1)
+
+    otf = np.fft.fft2(psf_pad)
+    channel_f = np.fft.fft2(channel)
+    k = max(1e-5, (1.0 - np.clip(strength, 0.0, 1.0)) * 0.03)
+    deconv = np.fft.ifft2(channel_f * np.conj(otf) / (np.abs(otf) ** 2 + k)).real
+    return deconv.astype(np.float32)
+
+
+def apply_psd_deconvolution(image: np.ndarray, params: dict[str, float | str]) -> np.ndarray:
+    psf_size = int(round(float(params.get("psf_size", 3.0))))
+    seeing_index = float(params.get("seeing_index", 1.2))
+    psf_strength = float(params.get("psf_strength", 0.3))
+    blend = float(np.clip(float(params.get("blend", 1.0)), 0.0, 1.0))
+
+    if blend <= 0.0:
+        return image
+
+    psf = _make_psf(psf_size, seeing_index, psf_strength)
+    work = _clip01(image.astype(np.float32))
+
+    if work.ndim == 3 and work.shape[2] >= 3:
+        r_amt = float(np.clip(float(params.get("red_amount", 1.0)), 0.0, 1.0))
+        g_amt = float(np.clip(float(params.get("green_amount", 1.0)), 0.0, 1.0))
+        b_amt = float(np.clip(float(params.get("blue_amount", 1.0)), 0.0, 1.0))
+        l_amt = float(np.clip(float(params.get("luminance_amount", 1.0)), 0.0, 1.0))
+
+        channels = [work[..., 0], work[..., 1], work[..., 2]]
+        per_channel = [r_amt, g_amt, b_amt]
+        processed = []
+        for chan, amount in zip(channels, per_channel):
+            deconv = _fft_deconvolve(chan, psf, amount)
+            processed.append((1.0 - amount) * chan + amount * deconv)
+        rgb = np.stack(processed, axis=-1)
+
+        lab = _rgb_to_lab(_clip01(rgb))
+        l_norm = np.clip(lab[..., 0:1] / 100.0, 0.0, 1.0)
+        l_deconv = _fft_deconvolve(l_norm[..., 0], psf, l_amt)[..., np.newaxis]
+        lab[..., 0:1] = np.clip((1.0 - l_amt) * l_norm + l_amt * l_deconv, 0.0, 1.0) * 100.0
+        wet = _lab_to_rgb(lab)
+    else:
+        amount = float(np.clip(float(params.get("luminance_amount", 1.0)), 0.0, 1.0))
+        deconv = _fft_deconvolve(work, psf, amount)
+        wet = (1.0 - amount) * work + amount * deconv
+
+    return _clip01((1.0 - blend) * work + blend * wet)
+
+
 def apply_chroma_denoise(image: np.ndarray, params: dict[str, float | str]) -> np.ndarray:
     radius = float(params.get("radius", 0.0))
     strength = float(params.get("strength", 0.0))
@@ -475,17 +605,14 @@ def apply_chroma_denoise(image: np.ndarray, params: dict[str, float | str]) -> n
 
 def block_definitions() -> dict[str, BlockDefinition]:
     definitions = {
-        "brightness": BlockDefinition(
-            block_type="brightness",
-            label="Brightness",
-            parameters=[ParameterSpec("brightness", "Brightness", -1.0, 1.0, 0.01, 0.0)],
-            apply_fn=apply_brightness,
-        ),
-        "contrast": BlockDefinition(
-            block_type="contrast",
-            label="Contrast",
-            parameters=[ParameterSpec("contrast", "Contrast", 0.0, 3.0, 0.01, 1.0)],
-            apply_fn=apply_contrast,
+        "brightness_contrast": BlockDefinition(
+            block_type="brightness_contrast",
+            label="Brightness/Contrast",
+            parameters=[
+                ParameterSpec("brightness", "Brightness", -1.0, 1.0, 0.01, 0.0),
+                ParameterSpec("contrast", "Contrast", 0.0, 3.0, 0.01, 1.0),
+            ],
+            apply_fn=apply_brightness_contrast,
         ),
         "saturation": BlockDefinition(
             block_type="saturation",
@@ -534,9 +661,9 @@ def block_definitions() -> dict[str, BlockDefinition]:
             ],
             apply_fn=apply_channel_balance,
         ),
-        "midtone_transfer": BlockDefinition(
-            block_type="midtone_transfer",
-            label="Midtone transfer",
+        "levels_midtone_transfer": BlockDefinition(
+            block_type="levels_midtone_transfer",
+            label="Levels / Midtone Transfer",
             parameters=[
                 ParameterSpec(
                     "midtone_transfer",
@@ -545,14 +672,7 @@ def block_definitions() -> dict[str, BlockDefinition]:
                     1.0,
                     0.01,
                     0.5,
-                )
-            ],
-            apply_fn=apply_midtone_transfer,
-        ),
-        "levels": BlockDefinition(
-            block_type="levels",
-            label="Levels",
-            parameters=[
+                ),
                 ParameterSpec("shadows", "Shadows tone", -0.3, 0.3, 0.01, 0.0),
                 ParameterSpec("low_mid", "Low-mid tone", -0.3, 0.3, 0.01, 0.0),
                 ParameterSpec("high_mid", "High-mid tone", -0.3, 0.3, 0.01, 0.0),
@@ -561,7 +681,7 @@ def block_definitions() -> dict[str, BlockDefinition]:
                 ParameterSpec("low_mid_upper", "Low-mid / High-mid boundary", 0.02, 0.99, 0.01, 0.50),
                 ParameterSpec("high_mid_upper", "High-mid / Highlights boundary", 0.03, 1.00, 0.01, 0.78),
             ],
-            apply_fn=apply_levels,
+            apply_fn=apply_levels_midtone_transfer,
         ),
         "gaussian_blur": BlockDefinition(
             block_type="gaussian_blur",
@@ -613,15 +733,44 @@ def block_definitions() -> dict[str, BlockDefinition]:
             ],
             apply_fn=apply_high_pass_detail,
         ),
-        "rl_deconvolution": BlockDefinition(
-            block_type="rl_deconvolution",
-            label="RL deconvolution",
+        "wavelet_sharpening": BlockDefinition(
+            block_type="wavelet_sharpening",
+            label="Wavelet Sharpening",
             parameters=[
-                ParameterSpec("radius", "PSF radius", 0.0, 8.0, 0.05, 0.0),
-                ParameterSpec("iterations", "Iterations", 0.0, 30.0, 1.0, 0.0),
-                ParameterSpec("damping", "Damping", 0.0, 1.0, 0.01, 0.05),
+                ParameterSpec(
+                    "wavelet_mode",
+                    "Mode",
+                    0.0,
+                    0.0,
+                    1.0,
+                    "linear",
+                    input_type="choice",
+                    choices=["linear", "bspline"],
+                ),
+                ParameterSpec("layer1_amount", "Layer 1 amount", -2.0, 4.0, 0.01, 0.0),
+                ParameterSpec("layer1_noise_reduction", "Layer 1 noise reduction", 0.0, 1.0, 0.01, 0.0),
+                ParameterSpec("layer2_amount", "Layer 2 amount", -2.0, 4.0, 0.01, 0.0),
+                ParameterSpec("layer2_noise_reduction", "Layer 2 noise reduction", 0.0, 1.0, 0.01, 0.0),
+                ParameterSpec("layer3_amount", "Layer 3 amount", -2.0, 4.0, 0.01, 0.0),
+                ParameterSpec("layer3_noise_reduction", "Layer 3 noise reduction", 0.0, 1.0, 0.01, 0.0),
+                ParameterSpec("recovery_amount", "Recovery layer amount", 0.0, 1.0, 0.01, 0.0),
             ],
-            apply_fn=apply_rl_deconvolution,
+            apply_fn=apply_wavelet_sharpening,
+        ),
+        "psd_deconvolution": BlockDefinition(
+            block_type="psd_deconvolution",
+            label="PSD Deconvolution",
+            parameters=[
+                ParameterSpec("psf_size", "PSF Size", 3.0, 25.0, 2.0, 7.0),
+                ParameterSpec("seeing_index", "Seeing Index", 0.3, 6.0, 0.05, 1.2),
+                ParameterSpec("psf_strength", "PSF Strength", 0.0, 1.0, 0.01, 0.3),
+                ParameterSpec("blend", "Dry/Wet Blend", 0.0, 1.0, 0.01, 1.0),
+                ParameterSpec("red_amount", "R channel", 0.0, 1.0, 0.01, 1.0),
+                ParameterSpec("green_amount", "G channel", 0.0, 1.0, 0.01, 1.0),
+                ParameterSpec("blue_amount", "B channel", 0.0, 1.0, 0.01, 1.0),
+                ParameterSpec("luminance_amount", "Luminance", 0.0, 1.0, 0.01, 1.0),
+            ],
+            apply_fn=apply_psd_deconvolution,
         ),
         "chroma_denoise": BlockDefinition(
             block_type="chroma_denoise",
@@ -657,10 +806,17 @@ def serialize_block(block: PipelineBlock) -> dict[str, Any]:
 
 def deserialize_block(data: dict[str, Any], definitions: dict[str, BlockDefinition]) -> PipelineBlock:
     block_type = data["type"]
-    block = instantiate_block(block_type, definitions)
-    block.enabled = bool(data.get("enabled", True))
     incoming = data.get("parameters", {})
 
+    if block_type in {"brightness", "contrast"}:
+        block_type = "brightness_contrast"
+    elif block_type in {"midtone_transfer", "levels"}:
+        block_type = "levels_midtone_transfer"
+    elif block_type == "rl_deconvolution":
+        block_type = "psd_deconvolution"
+
+    block = instantiate_block(block_type, definitions)
+    block.enabled = bool(data.get("enabled", True))
     if (
         block_type == "saturation"
         and "saturation" in incoming
@@ -676,13 +832,30 @@ def deserialize_block(data: dict[str, Any], definitions: dict[str, BlockDefiniti
             "saturation_highlights": legacy_value,
         }
 
-    if block_type == "levels":
+    if block_type == "levels_midtone_transfer":
         # Backward compatibility with older pipelines that had 6 boundaries.
         incoming = {
             **incoming,
             "shadow_upper": incoming.get("shadow_upper", incoming.get("low_mid_lower", 0.25)),
             "low_mid_upper": incoming.get("low_mid_upper", incoming.get("high_mid_lower", 0.50)),
             "high_mid_upper": incoming.get("high_mid_upper", incoming.get("highlights_lower", 0.78)),
+        }
+
+
+    if data["type"] in {"brightness", "contrast"}:
+        incoming = {
+            **incoming,
+            "brightness": float(incoming.get("brightness", 0.0)),
+            "contrast": float(incoming.get("contrast", 1.0)),
+        }
+
+    if data["type"] == "rl_deconvolution":
+        incoming = {
+            **incoming,
+            "psf_size": max(3.0, float(incoming.get("radius", 0.0)) * 2.0 + 1.0),
+            "seeing_index": 1.2,
+            "psf_strength": 0.3,
+            "blend": 1.0,
         }
 
     for spec in definitions[block_type].parameters:
