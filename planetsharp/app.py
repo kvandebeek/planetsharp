@@ -1,0 +1,346 @@
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+import numpy as np
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QGuiApplication
+from PySide6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QFileDialog,
+    QFrame,
+    QGridLayout,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QListWidgetItem,
+    QMainWindow,
+    QMessageBox,
+    QPushButton,
+    QSlider,
+    QVBoxLayout,
+    QWidget,
+)
+
+from .blocks import (
+    block_definitions,
+    deserialize_block,
+    instantiate_block,
+    serialize_block,
+)
+from .io_utils import load_image, load_pipeline, save_image_16bit, save_pipeline
+from .widgets import HistogramWidget, ImageViewer
+
+DARK_STYLE = """
+QWidget { background-color: #121212; color: #E0E0E0; font-size: 12px; }
+QPushButton { background-color: #2A2A2A; border: 1px solid #3A3A3A; border-radius: 4px; padding: 6px; }
+QPushButton:hover { background-color: #333333; }
+QListWidget { background-color: #0F0F0F; border: 1px solid #333333; }
+QFrame { border: 1px solid #2E2E2E; }
+QSlider::groove:horizontal { height: 6px; background: #2A2A2A; }
+QSlider::handle:horizontal { width: 12px; background: #8AB4F8; margin: -4px 0; border-radius: 6px; }
+"""
+
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("PlanetSharp")
+        self.setWindowFlags(
+            Qt.WindowType.Window
+            | Qt.WindowType.CustomizeWindowHint
+            | Qt.WindowType.WindowTitleHint
+            | Qt.WindowType.WindowCloseButtonHint
+        )
+        self.setStyleSheet(DARK_STYLE)
+
+        self.definitions = block_definitions()
+        self.original_native: np.ndarray | None = None
+        self.original_float: np.ndarray | None = None
+        self.rendered_float: np.ndarray | None = None
+        self.pipeline = []
+
+        central = QWidget()
+        root = QVBoxLayout(central)
+        self.setCentralWidget(central)
+
+        # Row 1: File actions
+        top_row = QHBoxLayout()
+        self.open_btn = QPushButton("Open")
+        self.save_btn = QPushButton("Save")
+        self.save_pipeline_btn = QPushButton("Save pipeline")
+        self.load_pipeline_btn = QPushButton("Load pipeline")
+        for b in [self.open_btn, self.save_btn, self.save_pipeline_btn, self.load_pipeline_btn]:
+            top_row.addWidget(b)
+        top_row.addStretch(1)
+        root.addLayout(top_row)
+
+        # Row 2: Viewer + histogram
+        viewer_row = QHBoxLayout()
+        viewer_frame = QFrame()
+        viewer_layout = QVBoxLayout(viewer_frame)
+        self.viewer = ImageViewer()
+        zoom_row = QHBoxLayout()
+        self.zoom_in_btn = QPushButton("Zoom +")
+        self.zoom_out_btn = QPushButton("Zoom -")
+        self.zoom_reset_btn = QPushButton("Reset zoom")
+        self.pixel_label = QLabel("x=-, y=-, value=-")
+        for b in [self.zoom_in_btn, self.zoom_out_btn, self.zoom_reset_btn]:
+            zoom_row.addWidget(b)
+        zoom_row.addWidget(self.pixel_label)
+        zoom_row.addStretch(1)
+        viewer_layout.addWidget(self.viewer)
+        viewer_layout.addLayout(zoom_row)
+
+        hist_frame = QFrame()
+        hist_layout = QVBoxLayout(hist_frame)
+        hist_controls = QHBoxLayout()
+        self.hist_mode = QComboBox()
+        self.hist_mode.addItems(["luminance", "per-channel"])
+        self.hist_scale = QComboBox()
+        self.hist_scale.addItems(["linear", "log"])
+        hist_controls.addWidget(QLabel("Mode"))
+        hist_controls.addWidget(self.hist_mode)
+        hist_controls.addWidget(QLabel("Scale"))
+        hist_controls.addWidget(self.hist_scale)
+        hist_controls.addStretch(1)
+        self.histogram = HistogramWidget()
+        hist_layout.addLayout(hist_controls)
+        hist_layout.addWidget(self.histogram)
+
+        viewer_row.addWidget(viewer_frame, 3)
+        viewer_row.addWidget(hist_frame, 1)
+        root.addLayout(viewer_row, 3)
+
+        # Row 3: Pipeline (3 columns)
+        bottom = QHBoxLayout()
+
+        library_frame = QFrame()
+        library_layout = QVBoxLayout(library_frame)
+        library_layout.addWidget(QLabel("Block library"))
+        for key in ["brightness", "contrast", "saturation", "gaussian_blur"]:
+            row = QHBoxLayout()
+            row.addWidget(QLabel(self.definitions[key].label))
+            btn = QPushButton("->")
+            btn.clicked.connect(lambda _=False, k=key: self.add_block(k))
+            row.addWidget(btn)
+            library_layout.addLayout(row)
+        library_layout.addStretch(1)
+
+        pipeline_frame = QFrame()
+        pipeline_layout = QVBoxLayout(pipeline_frame)
+        pipeline_layout.addWidget(QLabel("Pipeline overview"))
+        self.pipeline_list = QListWidget()
+        self.pipeline_list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
+        self.pipeline_list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.pipeline_list.model().rowsMoved.connect(self.sync_pipeline_from_ui)
+        pipeline_layout.addWidget(self.pipeline_list)
+        action_row = QHBoxLayout()
+        self.remove_btn = QPushButton("Remove")
+        self.reset_btn = QPushButton("Reset")
+        self.enable_checkbox = QCheckBox("Enabled")
+        action_row.addWidget(self.remove_btn)
+        action_row.addWidget(self.reset_btn)
+        action_row.addWidget(self.enable_checkbox)
+        pipeline_layout.addLayout(action_row)
+
+        adjust_frame = QFrame()
+        self.adjust_layout = QVBoxLayout(adjust_frame)
+        self.adjust_layout.addWidget(QLabel("Adjustment panel"))
+        self.adjust_host = QWidget()
+        self.adjust_form = QGridLayout(self.adjust_host)
+        self.adjust_layout.addWidget(self.adjust_host)
+        self.adjust_layout.addStretch(1)
+
+        bottom.addWidget(library_frame, 1)
+        bottom.addWidget(pipeline_frame, 1)
+        bottom.addWidget(adjust_frame, 2)
+        root.addLayout(bottom, 2)
+
+        self.open_btn.clicked.connect(self.on_open)
+        self.save_btn.clicked.connect(self.on_save)
+        self.save_pipeline_btn.clicked.connect(self.on_save_pipeline)
+        self.load_pipeline_btn.clicked.connect(self.on_load_pipeline)
+        self.zoom_in_btn.clicked.connect(self.viewer.zoom_in)
+        self.zoom_out_btn.clicked.connect(self.viewer.zoom_out)
+        self.zoom_reset_btn.clicked.connect(self.viewer.reset_zoom)
+        self.viewer.pixelHovered.connect(self.pixel_label.setText)
+        self.pipeline_list.currentRowChanged.connect(self.on_selected_block_changed)
+        self.remove_btn.clicked.connect(self.remove_selected)
+        self.reset_btn.clicked.connect(self.reset_selected)
+        self.enable_checkbox.toggled.connect(self.toggle_selected_enabled)
+        self.hist_mode.currentTextChanged.connect(self.on_hist_mode_changed)
+        self.hist_scale.currentTextChanged.connect(self.on_hist_scale_changed)
+
+        screen = QGuiApplication.primaryScreen()
+        if screen:
+            self.setGeometry(screen.availableGeometry())
+
+    def on_hist_mode_changed(self, value: str) -> None:
+        self.histogram.set_mode("luminance" if value == "luminance" else "per-channel")
+
+    def on_hist_scale_changed(self, value: str) -> None:
+        self.histogram.set_scale(value)
+
+    def on_open(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Open image", "", "Images (*.png *.tif *.tiff)")
+        if not path:
+            return
+        try:
+            self.original_native, self.original_float = load_image(path)
+            self.apply_pipeline()
+            self.viewer.reset_zoom()
+        except Exception as exc:
+            QMessageBox.critical(self, "Open failed", str(exc))
+
+    def on_save(self) -> None:
+        if self.rendered_float is None:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Save image", "", "Images (*.png *.tif *.tiff)")
+        if not path:
+            return
+        try:
+            save_image_16bit(path, self.rendered_float)
+        except Exception as exc:
+            QMessageBox.critical(self, "Save failed", str(exc))
+
+    def on_save_pipeline(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(self, "Save pipeline", "pipeline.json", "JSON (*.json)")
+        if not path:
+            return
+        save_pipeline(path, [serialize_block(block) for block in self.pipeline])
+
+    def on_load_pipeline(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Load pipeline", "", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            payload = load_pipeline(path)
+            self.pipeline = [deserialize_block(b, self.definitions) for b in payload["blocks"]]
+            self.refresh_pipeline_list()
+            self.apply_pipeline()
+        except Exception as exc:
+            QMessageBox.critical(self, "Load pipeline failed", str(exc))
+
+    def add_block(self, block_type: str) -> None:
+        self.pipeline.append(instantiate_block(block_type, self.definitions))
+        self.refresh_pipeline_list()
+        self.pipeline_list.setCurrentRow(len(self.pipeline) - 1)
+        self.apply_pipeline()
+
+    def refresh_pipeline_list(self) -> None:
+        self.pipeline_list.clear()
+        for block in self.pipeline:
+            item = QListWidgetItem(f"{block.label} ({'on' if block.enabled else 'off'})")
+            self.pipeline_list.addItem(item)
+
+    def sync_pipeline_from_ui(self, *_args) -> None:
+        old = list(self.pipeline)
+        reordered = []
+        used = [False] * len(old)
+        for i in range(self.pipeline_list.count()):
+            text = self.pipeline_list.item(i).text()
+            for j, block in enumerate(old):
+                label = f"{block.label} ({'on' if block.enabled else 'off'})"
+                if not used[j] and text == label:
+                    reordered.append(block)
+                    used[j] = True
+                    break
+        if len(reordered) == len(old):
+            self.pipeline = reordered
+            self.apply_pipeline()
+
+    def on_selected_block_changed(self, row: int) -> None:
+        self.rebuild_adjustment_panel(row)
+
+    def rebuild_adjustment_panel(self, row: int) -> None:
+        while self.adjust_form.count():
+            child = self.adjust_form.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+        if row < 0 or row >= len(self.pipeline):
+            self.enable_checkbox.setChecked(False)
+            return
+
+        block = self.pipeline[row]
+        self.enable_checkbox.blockSignals(True)
+        self.enable_checkbox.setChecked(block.enabled)
+        self.enable_checkbox.blockSignals(False)
+
+        definition = self.definitions[block.block_type]
+        for idx, spec in enumerate(definition.parameters):
+            label = QLabel(spec.label)
+            slider = QSlider(Qt.Orientation.Horizontal)
+            slider.setMinimum(0)
+            steps = int(round((spec.max_value - spec.min_value) / spec.step))
+            slider.setMaximum(steps)
+            current = block.parameters[spec.key]
+            slider.setValue(int(round((current - spec.min_value) / spec.step)))
+            value_label = QLabel(f"{current:.2f}")
+
+            def make_handler(b=block, s=spec, sl=slider, vl=value_label):
+                def handler(value: int) -> None:
+                    b.parameters[s.key] = s.min_value + value * s.step
+                    vl.setText(f"{b.parameters[s.key]:.2f}")
+                    self.apply_pipeline()
+                return handler
+
+            slider.valueChanged.connect(make_handler())
+            self.adjust_form.addWidget(label, idx, 0)
+            self.adjust_form.addWidget(slider, idx, 1)
+            self.adjust_form.addWidget(value_label, idx, 2)
+
+    def remove_selected(self) -> None:
+        row = self.pipeline_list.currentRow()
+        if row < 0:
+            return
+        self.pipeline.pop(row)
+        self.refresh_pipeline_list()
+        if self.pipeline:
+            self.pipeline_list.setCurrentRow(min(row, len(self.pipeline) - 1))
+        self.apply_pipeline()
+
+    def reset_selected(self) -> None:
+        row = self.pipeline_list.currentRow()
+        if row < 0:
+            return
+        block = self.pipeline[row]
+        for spec in self.definitions[block.block_type].parameters:
+            block.parameters[spec.key] = spec.default
+        self.rebuild_adjustment_panel(row)
+        self.apply_pipeline()
+
+    def toggle_selected_enabled(self, enabled: bool) -> None:
+        row = self.pipeline_list.currentRow()
+        if row < 0:
+            return
+        self.pipeline[row].enabled = enabled
+        self.refresh_pipeline_list()
+        self.pipeline_list.setCurrentRow(row)
+        self.apply_pipeline()
+
+    def apply_pipeline(self) -> None:
+        if self.original_float is None:
+            self.rendered_float = None
+            self.viewer.set_image(None)
+            self.histogram.set_image(None)
+            return
+        out = self.original_float.copy()
+        for block in self.pipeline:
+            if not block.enabled:
+                continue
+            definition = self.definitions[block.block_type]
+            out = definition.apply_fn(out, block.parameters)
+        self.rendered_float = np.clip(out, 0.0, 1.0).astype(np.float32)
+        self.viewer.set_image(self.rendered_float)
+        self.histogram.set_image(self.rendered_float)
+
+
+def run() -> None:
+    app = QApplication(sys.argv)
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec())
