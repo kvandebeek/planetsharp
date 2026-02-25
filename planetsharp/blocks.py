@@ -94,19 +94,22 @@ def _smoothstep(edge0: float, edge1: float, x: np.ndarray) -> np.ndarray:
 
 
 def normalize_levels_boundaries(params: dict[str, float | str]) -> dict[str, float]:
-    shadow_upper = float(params.get("shadow_upper", 0.25))
-    low_mid_lower = float(params.get("low_mid_lower", 0.20))
-    low_mid_upper = float(params.get("low_mid_upper", 0.50))
-    high_mid_lower = float(params.get("high_mid_lower", 0.50))
-    high_mid_upper = float(params.get("high_mid_upper", 0.80))
-    highlights_lower = float(params.get("highlights_lower", 0.75))
+    # Keep three canonical boundaries so tonal ranges always "stick" together
+    # with no gaps:
+    # shadows/high-mid boundary  => shadow_upper == low_mid_lower
+    # low-mid/high-mid boundary => low_mid_upper == high_mid_lower
+    # high-mid/highlights       => high_mid_upper == highlights_lower
+    shadow_upper = float(params.get("shadow_upper", params.get("low_mid_lower", 0.25)))
+    low_mid_upper = float(params.get("low_mid_upper", params.get("high_mid_lower", 0.50)))
+    high_mid_upper = float(params.get("high_mid_upper", params.get("highlights_lower", 0.78)))
 
-    shadow_upper = float(np.clip(shadow_upper, 0.01, 0.95))
-    low_mid_lower = float(np.clip(low_mid_lower, shadow_upper + 0.01, 0.95))
-    low_mid_upper = float(np.clip(low_mid_upper, low_mid_lower + 0.01, 0.97))
-    high_mid_lower = float(np.clip(high_mid_lower, low_mid_upper + 0.01, 0.98))
-    high_mid_upper = float(np.clip(high_mid_upper, high_mid_lower + 0.01, 0.99))
-    highlights_lower = float(np.clip(highlights_lower, high_mid_upper + 0.01, 1.0))
+    shadow_upper = float(np.clip(shadow_upper, 0.01, 0.98))
+    low_mid_upper = float(np.clip(low_mid_upper, shadow_upper + 0.01, 0.99))
+    high_mid_upper = float(np.clip(high_mid_upper, low_mid_upper + 0.01, 1.0))
+
+    low_mid_lower = shadow_upper
+    high_mid_lower = low_mid_upper
+    highlights_lower = high_mid_upper
 
     return {
         "shadow_upper": shadow_upper,
@@ -378,12 +381,9 @@ def block_definitions() -> dict[str, BlockDefinition]:
                 ParameterSpec("low_mid", "Low-mid tone", -0.3, 0.3, 0.01, 0.0),
                 ParameterSpec("high_mid", "High-mid tone", -0.3, 0.3, 0.01, 0.0),
                 ParameterSpec("highlights", "Highlights tone", -0.3, 0.3, 0.01, 0.0),
-                ParameterSpec("shadow_upper", "Shadows upper boundary", 0.01, 0.95, 0.01, 0.25),
-                ParameterSpec("low_mid_lower", "Low-mid lower boundary", 0.02, 0.96, 0.01, 0.30),
-                ParameterSpec("low_mid_upper", "Low-mid upper boundary", 0.03, 0.97, 0.01, 0.50),
-                ParameterSpec("high_mid_lower", "High-mid lower boundary", 0.04, 0.98, 0.01, 0.60),
-                ParameterSpec("high_mid_upper", "High-mid upper boundary", 0.05, 0.99, 0.01, 0.78),
-                ParameterSpec("highlights_lower", "Highlights lower boundary", 0.06, 1.00, 0.01, 0.86),
+                ParameterSpec("shadow_upper", "Shadows / Low-mid boundary", 0.01, 0.98, 0.01, 0.25),
+                ParameterSpec("low_mid_upper", "Low-mid / High-mid boundary", 0.02, 0.99, 0.01, 0.50),
+                ParameterSpec("high_mid_upper", "High-mid / Highlights boundary", 0.03, 1.00, 0.01, 0.78),
             ],
             apply_fn=apply_levels,
         ),
@@ -449,6 +449,15 @@ def deserialize_block(data: dict[str, Any], definitions: dict[str, BlockDefiniti
             "saturation_shadows": legacy_value,
             "saturation_midtones": legacy_value,
             "saturation_highlights": legacy_value,
+        }
+
+    if block_type == "levels":
+        # Backward compatibility with older pipelines that had 6 boundaries.
+        incoming = {
+            **incoming,
+            "shadow_upper": incoming.get("shadow_upper", incoming.get("low_mid_lower", 0.25)),
+            "low_mid_upper": incoming.get("low_mid_upper", incoming.get("high_mid_lower", 0.50)),
+            "high_mid_upper": incoming.get("high_mid_upper", incoming.get("highlights_lower", 0.78)),
         }
 
     for spec in definitions[block_type].parameters:

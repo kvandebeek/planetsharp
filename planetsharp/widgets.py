@@ -187,11 +187,8 @@ class HistogramWidget(QWidget):
         painter.setPen(boundary_color)
         boundary_keys = [
             "shadow_upper",
-            "low_mid_lower",
             "low_mid_upper",
-            "high_mid_lower",
             "high_mid_upper",
-            "highlights_lower",
         ]
         for key in boundary_keys:
             x = int(np.clip(float(boundaries.get(key, 0.0)), 0.0, 1.0) * (width - 1))
