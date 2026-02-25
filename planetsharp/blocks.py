@@ -79,6 +79,22 @@ def apply_saturation(image: np.ndarray, params: dict[str, float | str]) -> np.nd
     return _clip01(luminance + (image - luminance) * saturation_map)
 
 
+def apply_levels(image: np.ndarray, params: dict[str, float | str]) -> np.ndarray:
+    if image.ndim != 3 or image.shape[2] < 3:
+        return image
+
+    shadows = float(params.get("levels_shadows", 1.0))
+    low_mid = float(params.get("levels_low_mid", 1.0))
+    high_mid = float(params.get("levels_high_mid", 1.0))
+    highlights = float(params.get("levels_highlights", 1.0))
+
+    luminance = 0.2126 * image[..., 0] + 0.7152 * image[..., 1] + 0.0722 * image[..., 2]
+    tonal_curve_x = np.array([0.0, 1.0 / 3.0, 2.0 / 3.0, 1.0], dtype=np.float32)
+    tonal_curve_y = np.array([shadows, low_mid, high_mid, highlights], dtype=np.float32)
+    gain_map = np.interp(np.clip(luminance, 0.0, 1.0), tonal_curve_x, tonal_curve_y)
+    return _clip01(image * gain_map[..., None])
+
+
 def _gaussian_kernel_1d(size: int, strength: float) -> np.ndarray:
     size = max(1, int(size))
     if size % 2 == 0:
@@ -255,6 +271,17 @@ def block_definitions() -> dict[str, BlockDefinition]:
                 ),
             ],
             apply_fn=apply_saturation,
+        ),
+        "levels": BlockDefinition(
+            block_type="levels",
+            label="Levels",
+            parameters=[
+                ParameterSpec("levels_shadows", "Shadows", 0.0, 2.0, 0.01, 1.0),
+                ParameterSpec("levels_low_mid", "Low mid", 0.0, 2.0, 0.01, 1.0),
+                ParameterSpec("levels_high_mid", "High mid", 0.0, 2.0, 0.01, 1.0),
+                ParameterSpec("levels_highlights", "Highlights", 0.0, 2.0, 0.01, 1.0),
+            ],
+            apply_fn=apply_levels,
         ),
         "gaussian_blur": BlockDefinition(
             block_type="gaussian_blur",
