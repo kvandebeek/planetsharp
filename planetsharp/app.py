@@ -5,7 +5,7 @@ from pathlib import Path
 
 import numpy as np
 import psutil
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QTimer, Qt
 from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
     QApplication,
@@ -76,6 +76,9 @@ class MainWindow(QMainWindow):
         self.rendered_float: np.ndarray | None = None
         self.pipeline = []
         self.default_image_folder = load_default_image_folder()
+        self._pipeline_apply_timer = QTimer(self)
+        self._pipeline_apply_timer.setSingleShot(True)
+        self._pipeline_apply_timer.timeout.connect(self._apply_pipeline_now)
 
         central = QWidget()
         root = QVBoxLayout(central)
@@ -531,6 +534,11 @@ class MainWindow(QMainWindow):
         self.update_histogram_levels_overlay()
 
     def apply_pipeline(self) -> None:
+        if self._pipeline_apply_timer.isActive():
+            self._pipeline_apply_timer.stop()
+        self._pipeline_apply_timer.start(0)
+
+    def _apply_pipeline_now(self) -> None:
         if self.original_float is None:
             self.rendered_float = None
             self.viewer.set_image(None)
