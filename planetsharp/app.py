@@ -34,7 +34,14 @@ from .blocks import (
     normalize_levels_boundaries,
     serialize_block,
 )
-from .io_utils import load_image, load_pipeline, save_image_16bit, save_pipeline
+from .io_utils import (
+    load_default_image_folder,
+    load_image,
+    load_pipeline,
+    save_default_image_folder,
+    save_image_16bit,
+    save_pipeline,
+)
 from .widgets import HistogramWidget, ImageViewer
 
 DARK_STYLE = """
@@ -65,6 +72,7 @@ class MainWindow(QMainWindow):
         self.original_float: np.ndarray | None = None
         self.rendered_float: np.ndarray | None = None
         self.pipeline = []
+        self.default_image_folder = load_default_image_folder()
 
         central = QWidget()
         root = QVBoxLayout(central)
@@ -255,11 +263,17 @@ class MainWindow(QMainWindow):
         self.histogram.set_scale(value)
 
     def on_open(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Open image", "", "Images (*.png *.tif *.tiff)")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open image",
+            self.default_image_folder,
+            "Images (*.png *.tif *.tiff)",
+        )
         if not path:
             return
         try:
             self.original_native, self.original_float = load_image(path)
+            self._remember_image_folder(path)
             self.apply_pipeline()
             self.viewer.reset_zoom()
         except Exception as exc:
@@ -268,13 +282,24 @@ class MainWindow(QMainWindow):
     def on_save(self) -> None:
         if self.rendered_float is None:
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Save image", "", "Images (*.png *.tif *.tiff)")
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save image",
+            self.default_image_folder,
+            "Images (*.png *.tif *.tiff)",
+        )
         if not path:
             return
         try:
             save_image_16bit(path, self.rendered_float)
+            self._remember_image_folder(path)
         except Exception as exc:
             QMessageBox.critical(self, "Save failed", str(exc))
+
+    def _remember_image_folder(self, file_path: str) -> None:
+        folder = str(Path(file_path).parent)
+        self.default_image_folder = folder
+        save_default_image_folder(folder)
 
     def on_save_pipeline(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Save pipeline", "pipeline.json", "JSON (*.json)")
