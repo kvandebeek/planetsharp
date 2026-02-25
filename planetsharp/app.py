@@ -143,7 +143,10 @@ class MainWindow(QMainWindow):
         library_frame = QFrame()
         library_layout = QVBoxLayout(library_frame)
         library_layout.addWidget(QLabel("Block library"))
-        for key in ["brightness", "contrast", "saturation", "levels", "gaussian_blur"]:
+        preferred_block_order = ["brightness", "contrast", "saturation", "levels", "gaussian_blur"]
+        ordered_keys = [k for k in preferred_block_order if k in self.definitions]
+        ordered_keys.extend(k for k in self.definitions if k not in ordered_keys)
+        for key in ordered_keys:
             row = QHBoxLayout()
             row.addWidget(QLabel(self.definitions[key].label))
             btn = QPushButton("->")

@@ -347,6 +347,23 @@ def deserialize_block(data: dict[str, Any], definitions: dict[str, BlockDefiniti
             "saturation_highlights": legacy_value,
         }
 
+    if (
+        block_type == "levels"
+        and "levels" in incoming
+        and "levels_shadows" not in incoming
+        and "levels_low_mid" not in incoming
+        and "levels_high_mid" not in incoming
+        and "levels_highlights" not in incoming
+    ):
+        legacy_value = float(incoming["levels"])
+        incoming = {
+            **incoming,
+            "levels_shadows": legacy_value,
+            "levels_low_mid": legacy_value,
+            "levels_high_mid": legacy_value,
+            "levels_highlights": legacy_value,
+        }
+
     for spec in definitions[block_type].parameters:
         if spec.key not in incoming:
             continue
