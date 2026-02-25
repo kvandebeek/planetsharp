@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from .blocks import (
+    _make_psf,
     block_definitions,
     deserialize_block,
     instantiate_block,
@@ -156,9 +157,9 @@ class MainWindow(QMainWindow):
         library_layout.addWidget(QLabel("Block library"))
 
         self.library_sections = {
-            "Tone & Dynamic Range": ["brightness", "contrast", "midtone_transfer", "levels"],
+            "Tone & Dynamic Range": ["brightness_contrast", "levels_midtone_transfer"],
             "Color": ["saturation", "hue_shift", "channel_balance"],
-            "Sharpening & Detail": ["rl_deconvolution", "unsharp_mask", "high_pass_detail"],
+            "Sharpening & Detail": ["psd_deconvolution", "wavelet_sharpening", "unsharp_mask", "high_pass_detail"],
             "Blurring & Denoise": ["gaussian_blur", "chroma_denoise"],
         }
         for section, keys in self.library_sections.items():
@@ -365,7 +366,7 @@ class MainWindow(QMainWindow):
         self.update_histogram_levels_overlay()
 
     def _sanitize_levels_block_parameters(self, block) -> None:
-        if block.block_type != "levels":
+        if block.block_type != "levels_midtone_transfer":
             return
         boundaries = normalize_levels_boundaries(block.parameters)
         for key, value in boundaries.items():
@@ -377,7 +378,7 @@ class MainWindow(QMainWindow):
             self.histogram.set_levels_overlay(None)
             return
         block = self.pipeline[row]
-        if block.block_type != "levels":
+        if block.block_type != "levels_midtone_transfer":
             self.histogram.set_levels_overlay(None)
             return
         self._sanitize_levels_block_parameters(block)
@@ -470,7 +471,7 @@ class MainWindow(QMainWindow):
             def make_handler(b=block, s=spec, vl=value_label):
                 def handler(value: int) -> None:
                     b.parameters[s.key] = s.min_value + value * s.step
-                    if b.block_type == "levels":
+                    if b.block_type == "levels_midtone_transfer":
                         self._sanitize_levels_block_parameters(b)
                     vl.setText(f"{float(b.parameters[s.key]):.2f}")
                     self.apply_pipeline()
@@ -480,6 +481,22 @@ class MainWindow(QMainWindow):
             slider.valueChanged.connect(make_handler())
             self.adjust_form.addWidget(slider, row_index, 1)
             self.adjust_form.addWidget(value_label, row_index, 2)
+            row_index += 1
+
+        if block.block_type == "psd_deconvolution":
+            psf_size = int(round(float(block.parameters.get("psf_size", 7.0))))
+            seeing_index = float(block.parameters.get("seeing_index", 1.2))
+            psf_strength = float(block.parameters.get("psf_strength", 0.3))
+            psf = _make_psf(psf_size, seeing_index, psf_strength)
+            psf_label = QLabel("PSF kernel")
+            psf_label.setStyleSheet("font-weight: 600; color: #8AB4F8;")
+            self.adjust_form.addWidget(psf_label, row_index, 0, 1, 3)
+            row_index += 1
+            psf_text = "\n".join(" ".join(f"{v:0.3f}" for v in r) for r in psf)
+            psf_value = QLabel(psf_text)
+            psf_value.setStyleSheet("font-family: monospace;")
+            psf_value.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            self.adjust_form.addWidget(psf_value, row_index, 0, 1, 3)
             row_index += 1
 
     def remove_selected(self) -> None:
