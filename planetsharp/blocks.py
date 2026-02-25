@@ -86,6 +86,98 @@ def apply_midtone_transfer(image: np.ndarray, params: dict[str, float | str]) ->
     return _clip01(np.power(_clip01(image), gamma))
 
 
+def _smoothstep(edge0: float, edge1: float, x: np.ndarray) -> np.ndarray:
+    if edge1 <= edge0:
+        return np.where(x >= edge1, 1.0, 0.0).astype(np.float32)
+    t = np.clip((x - edge0) / (edge1 - edge0), 0.0, 1.0)
+    return (t * t * (3.0 - 2.0 * t)).astype(np.float32)
+
+
+def normalize_levels_boundaries(params: dict[str, float | str]) -> dict[str, float]:
+    shadow_upper = float(params.get("shadow_upper", 0.25))
+    low_mid_lower = float(params.get("low_mid_lower", 0.20))
+    low_mid_upper = float(params.get("low_mid_upper", 0.50))
+    high_mid_lower = float(params.get("high_mid_lower", 0.50))
+    high_mid_upper = float(params.get("high_mid_upper", 0.80))
+    highlights_lower = float(params.get("highlights_lower", 0.75))
+
+    shadow_upper = float(np.clip(shadow_upper, 0.01, 0.95))
+    low_mid_lower = float(np.clip(low_mid_lower, shadow_upper + 0.01, 0.95))
+    low_mid_upper = float(np.clip(low_mid_upper, low_mid_lower + 0.01, 0.97))
+    high_mid_lower = float(np.clip(high_mid_lower, low_mid_upper + 0.01, 0.98))
+    high_mid_upper = float(np.clip(high_mid_upper, high_mid_lower + 0.01, 0.99))
+    highlights_lower = float(np.clip(highlights_lower, high_mid_upper + 0.01, 1.0))
+
+    return {
+        "shadow_upper": shadow_upper,
+        "low_mid_lower": low_mid_lower,
+        "low_mid_upper": low_mid_upper,
+        "high_mid_lower": high_mid_lower,
+        "high_mid_upper": high_mid_upper,
+        "highlights_lower": highlights_lower,
+    }
+
+
+def apply_levels(image: np.ndarray, params: dict[str, float | str]) -> np.ndarray:
+    if image.ndim != 3 or image.shape[2] < 3:
+        return image
+
+    boundaries = normalize_levels_boundaries(params)
+    shadows = float(params.get("shadows", 0.0))
+    low_mid = float(params.get("low_mid", 0.0))
+    high_mid = float(params.get("high_mid", 0.0))
+    highlights = float(params.get("highlights", 0.0))
+
+    luminance = (
+        0.2126 * image[..., 0:1] + 0.7152 * image[..., 1:2] + 0.0722 * image[..., 2:3]
+    ).astype(np.float32)
+
+    softness = 0.03
+    shadow_weight = 1.0 - _smoothstep(
+        boundaries["shadow_upper"] - softness,
+        boundaries["shadow_upper"] + softness,
+        luminance,
+    )
+    low_mid_weight = _smoothstep(
+        boundaries["low_mid_lower"] - softness,
+        boundaries["low_mid_lower"] + softness,
+        luminance,
+    ) * (1.0 - _smoothstep(
+        boundaries["low_mid_upper"] - softness,
+        boundaries["low_mid_upper"] + softness,
+        luminance,
+    ))
+    high_mid_weight = _smoothstep(
+        boundaries["high_mid_lower"] - softness,
+        boundaries["high_mid_lower"] + softness,
+        luminance,
+    ) * (1.0 - _smoothstep(
+        boundaries["high_mid_upper"] - softness,
+        boundaries["high_mid_upper"] + softness,
+        luminance,
+    ))
+    highlight_weight = _smoothstep(
+        boundaries["highlights_lower"] - softness,
+        boundaries["highlights_lower"] + softness,
+        luminance,
+    )
+
+    total_weight = shadow_weight + low_mid_weight + high_mid_weight + highlight_weight
+    total_weight = np.clip(total_weight, 1e-6, None)
+    shadow_weight /= total_weight
+    low_mid_weight /= total_weight
+    high_mid_weight /= total_weight
+    highlight_weight /= total_weight
+
+    gain = (
+        shadow_weight * (1.0 + shadows)
+        + low_mid_weight * (1.0 + low_mid)
+        + high_mid_weight * (1.0 + high_mid)
+        + highlight_weight * (1.0 + highlights)
+    )
+    return _clip01(image * gain)
+
+
 def _gaussian_kernel_1d(size: int, strength: float) -> np.ndarray:
     size = max(1, int(size))
     if size % 2 == 0:
@@ -277,6 +369,23 @@ def block_definitions() -> dict[str, BlockDefinition]:
                 )
             ],
             apply_fn=apply_midtone_transfer,
+        ),
+        "levels": BlockDefinition(
+            block_type="levels",
+            label="Levels",
+            parameters=[
+                ParameterSpec("shadows", "Shadows tone", -0.3, 0.3, 0.01, 0.0),
+                ParameterSpec("low_mid", "Low-mid tone", -0.3, 0.3, 0.01, 0.0),
+                ParameterSpec("high_mid", "High-mid tone", -0.3, 0.3, 0.01, 0.0),
+                ParameterSpec("highlights", "Highlights tone", -0.3, 0.3, 0.01, 0.0),
+                ParameterSpec("shadow_upper", "Shadows upper boundary", 0.01, 0.95, 0.01, 0.25),
+                ParameterSpec("low_mid_lower", "Low-mid lower boundary", 0.02, 0.96, 0.01, 0.30),
+                ParameterSpec("low_mid_upper", "Low-mid upper boundary", 0.03, 0.97, 0.01, 0.50),
+                ParameterSpec("high_mid_lower", "High-mid lower boundary", 0.04, 0.98, 0.01, 0.60),
+                ParameterSpec("high_mid_upper", "High-mid upper boundary", 0.05, 0.99, 0.01, 0.78),
+                ParameterSpec("highlights_lower", "Highlights lower boundary", 0.06, 1.00, 0.01, 0.86),
+            ],
+            apply_fn=apply_levels,
         ),
         "gaussian_blur": BlockDefinition(
             block_type="gaussian_blur",

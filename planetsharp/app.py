@@ -31,6 +31,7 @@ from .blocks import (
     block_definitions,
     deserialize_block,
     instantiate_block,
+    normalize_levels_boundaries,
     serialize_block,
 )
 from .io_utils import load_image, load_pipeline, save_image_16bit, save_pipeline
@@ -143,7 +144,7 @@ class MainWindow(QMainWindow):
         library_frame = QFrame()
         library_layout = QVBoxLayout(library_frame)
         library_layout.addWidget(QLabel("Block library"))
-        for key in ["brightness", "contrast", "saturation", "midtone_transfer", "gaussian_blur"]:
+        for key in ["brightness", "contrast", "saturation", "midtone_transfer", "levels", "gaussian_blur"]:
             row = QHBoxLayout()
             row.addWidget(QLabel(self.definitions[key].label))
             btn = QPushButton("->")
@@ -323,6 +324,40 @@ class MainWindow(QMainWindow):
 
     def on_selected_block_changed(self, row: int) -> None:
         self.rebuild_adjustment_panel(row)
+        self.update_histogram_levels_overlay()
+
+    def _sanitize_levels_block_parameters(self, block) -> None:
+        if block.block_type != "levels":
+            return
+        boundaries = normalize_levels_boundaries(block.parameters)
+        for key, value in boundaries.items():
+            block.parameters[key] = value
+
+    def update_histogram_levels_overlay(self) -> None:
+        row = self.pipeline_list.currentRow()
+        if row < 0 or row >= len(self.pipeline):
+            self.histogram.set_levels_overlay(None)
+            return
+        block = self.pipeline[row]
+        if block.block_type != "levels":
+            self.histogram.set_levels_overlay(None)
+            return
+        self._sanitize_levels_block_parameters(block)
+        boundaries = {
+            "shadow_upper": float(block.parameters["shadow_upper"]),
+            "low_mid_lower": float(block.parameters["low_mid_lower"]),
+            "low_mid_upper": float(block.parameters["low_mid_upper"]),
+            "high_mid_lower": float(block.parameters["high_mid_lower"]),
+            "high_mid_upper": float(block.parameters["high_mid_upper"]),
+            "highlights_lower": float(block.parameters["highlights_lower"]),
+        }
+        adjustments = {
+            "shadows": float(block.parameters["shadows"]),
+            "low_mid": float(block.parameters["low_mid"]),
+            "high_mid": float(block.parameters["high_mid"]),
+            "highlights": float(block.parameters["highlights"]),
+        }
+        self.histogram.set_levels_overlay({"boundaries": boundaries, "adjustments": adjustments})
 
     def rebuild_adjustment_panel(self, row: int) -> None:
         while self.adjust_form.count():
@@ -334,6 +369,7 @@ class MainWindow(QMainWindow):
             return
 
         block = self.pipeline[row]
+        self._sanitize_levels_block_parameters(block)
         self.enable_checkbox.blockSignals(True)
         self.enable_checkbox.setChecked(block.enabled)
         self.enable_checkbox.blockSignals(False)
@@ -384,8 +420,11 @@ class MainWindow(QMainWindow):
             def make_handler(b=block, s=spec, vl=value_label):
                 def handler(value: int) -> None:
                     b.parameters[s.key] = s.min_value + value * s.step
+                    if b.block_type == "levels":
+                        self._sanitize_levels_block_parameters(b)
                     vl.setText(f"{float(b.parameters[s.key]):.2f}")
                     self.apply_pipeline()
+                    self.update_histogram_levels_overlay()
                 return handler
 
             slider.valueChanged.connect(make_handler())
@@ -411,6 +450,7 @@ class MainWindow(QMainWindow):
             block.parameters[spec.key] = spec.default
         self.rebuild_adjustment_panel(row)
         self.apply_pipeline()
+        self.update_histogram_levels_overlay()
 
     def toggle_selected_enabled(self, enabled: bool) -> None:
         row = self.pipeline_list.currentRow()
@@ -420,6 +460,7 @@ class MainWindow(QMainWindow):
         self.refresh_pipeline_list()
         self.pipeline_list.setCurrentRow(row)
         self.apply_pipeline()
+        self.update_histogram_levels_overlay()
 
     def apply_pipeline(self) -> None:
         if self.original_float is None:
@@ -436,6 +477,7 @@ class MainWindow(QMainWindow):
         self.rendered_float = np.clip(out, 0.0, 1.0).astype(np.float32)
         self.viewer.set_image(self.rendered_float)
         self.histogram.set_image(self.rendered_float)
+        self.update_histogram_levels_overlay()
 
 
 def run() -> None:
