@@ -10,6 +10,7 @@ from PIL import Image
 
 PIPELINE_VERSION = 1
 SUPPORTED_DTYPES = {np.uint8, np.uint16, np.uint32, np.float32, np.int32}
+IMAGECODECS_REQUIRED_MESSAGE = "requires the 'imagecodecs' package"
 
 
 def _as_rgb(image: np.ndarray) -> np.ndarray:
@@ -31,7 +32,7 @@ def load_image(path: str) -> tuple[np.ndarray, np.ndarray]:
     if suffix == ".png":
         arr = np.array(Image.open(path))
     else:
-        arr = tifffile.imread(path)
+        arr = _read_tiff(path)
 
     if arr.dtype.type not in SUPPORTED_DTYPES:
         raise ValueError("Only 8-bit, 16-bit, or 32-bit images are supported.")
@@ -45,6 +46,15 @@ def load_image(path: str) -> tuple[np.ndarray, np.ndarray]:
         normalized = arr.astype(np.float32)
         normalized = np.clip(normalized, 0.0, 1.0)
     return arr, normalized
+
+
+def _read_tiff(path: str) -> np.ndarray:
+    try:
+        return tifffile.imread(path)
+    except ValueError as exc:
+        if IMAGECODECS_REQUIRED_MESSAGE not in str(exc):
+            raise
+        return np.array(Image.open(path))
 
 
 def save_image_16bit(path: str, rendered_float: np.ndarray) -> None:
