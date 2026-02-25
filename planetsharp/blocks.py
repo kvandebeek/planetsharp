@@ -52,13 +52,31 @@ def apply_contrast(image: np.ndarray, params: dict[str, float | str]) -> np.ndar
 
 
 def apply_saturation(image: np.ndarray, params: dict[str, float | str]) -> np.ndarray:
-    saturation = float(params["saturation"])
     if image.ndim != 3 or image.shape[2] < 3:
         return image
+
+    # Backward compatibility: if an old pipeline provides only "saturation",
+    # use the same value for every tonal range.
+    legacy_saturation = float(params.get("saturation", 1.0))
+    saturation_shadows = float(params.get("saturation_shadows", legacy_saturation))
+    saturation_midtones = float(params.get("saturation_midtones", legacy_saturation))
+    saturation_highlights = float(params.get("saturation_highlights", legacy_saturation))
+
     luminance = (
         0.2126 * image[..., 0:1] + 0.7152 * image[..., 1:2] + 0.0722 * image[..., 2:3]
     )
-    return _clip01(luminance + (image - luminance) * saturation)
+
+    # Build smooth per-tonal-range weights from luminance in [0, 1].
+    shadow_weight = np.clip((0.5 - luminance) * 2.0, 0.0, 1.0)
+    highlight_weight = np.clip((luminance - 0.5) * 2.0, 0.0, 1.0)
+    midtone_weight = np.clip(1.0 - np.abs(luminance - 0.5) * 2.0, 0.0, 1.0)
+
+    saturation_map = (
+        shadow_weight * saturation_shadows
+        + midtone_weight * saturation_midtones
+        + highlight_weight * saturation_highlights
+    )
+    return _clip01(luminance + (image - luminance) * saturation_map)
 
 
 def _gaussian_kernel_1d(size: int, strength: float) -> np.ndarray:
@@ -210,7 +228,32 @@ def block_definitions() -> dict[str, BlockDefinition]:
         "saturation": BlockDefinition(
             block_type="saturation",
             label="Saturation",
-            parameters=[ParameterSpec("saturation", "Saturation", 0.0, 3.0, 0.01, 1.0)],
+            parameters=[
+                ParameterSpec(
+                    "saturation_shadows",
+                    "Saturation of shadows",
+                    0.0,
+                    3.0,
+                    0.01,
+                    1.0,
+                ),
+                ParameterSpec(
+                    "saturation_midtones",
+                    "Saturation of midtones",
+                    0.0,
+                    3.0,
+                    0.01,
+                    1.0,
+                ),
+                ParameterSpec(
+                    "saturation_highlights",
+                    "Saturation of highlights",
+                    0.0,
+                    3.0,
+                    0.01,
+                    1.0,
+                ),
+            ],
             apply_fn=apply_saturation,
         ),
         "gaussian_blur": BlockDefinition(
@@ -261,6 +304,22 @@ def deserialize_block(data: dict[str, Any], definitions: dict[str, BlockDefiniti
     block = instantiate_block(block_type, definitions)
     block.enabled = bool(data.get("enabled", True))
     incoming = data.get("parameters", {})
+
+    if (
+        block_type == "saturation"
+        and "saturation" in incoming
+        and "saturation_shadows" not in incoming
+        and "saturation_midtones" not in incoming
+        and "saturation_highlights" not in incoming
+    ):
+        legacy_value = float(incoming["saturation"])
+        incoming = {
+            **incoming,
+            "saturation_shadows": legacy_value,
+            "saturation_midtones": legacy_value,
+            "saturation_highlights": legacy_value,
+        }
+
     for spec in definitions[block_type].parameters:
         if spec.key not in incoming:
             continue
