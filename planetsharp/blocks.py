@@ -51,6 +51,60 @@ def apply_contrast(image: np.ndarray, params: dict[str, float | str]) -> np.ndar
     return _clip01((image - 0.5) * factor + 0.5)
 
 
+def apply_hue_shift(image: np.ndarray, params: dict[str, float | str]) -> np.ndarray:
+    if image.ndim != 3 or image.shape[2] < 3:
+        return image
+
+    hue_degrees = float(params.get("hue_shift", 0.0))
+    hue_delta = (hue_degrees / 360.0) % 1.0
+
+    rgb = _clip01(image.astype(np.float32))
+    r = rgb[..., 0]
+    g = rgb[..., 1]
+    b = rgb[..., 2]
+
+    cmax = np.maximum(np.maximum(r, g), b)
+    cmin = np.minimum(np.minimum(r, g), b)
+    delta = cmax - cmin
+
+    h = np.zeros_like(cmax)
+    nonzero = delta > 1e-8
+    r_mask = (cmax == r) & nonzero
+    g_mask = (cmax == g) & nonzero
+    b_mask = (cmax == b) & nonzero
+    h[r_mask] = ((g[r_mask] - b[r_mask]) / delta[r_mask]) % 6.0
+    h[g_mask] = ((b[g_mask] - r[g_mask]) / delta[g_mask]) + 2.0
+    h[b_mask] = ((r[b_mask] - g[b_mask]) / delta[b_mask]) + 4.0
+    h = (h / 6.0 + hue_delta) % 1.0
+
+    s = np.zeros_like(cmax)
+    nonzero_value = cmax > 1e-8
+    s[nonzero_value] = delta[nonzero_value] / cmax[nonzero_value]
+    v = cmax
+
+    i = np.floor(h * 6.0).astype(np.int32)
+    f = h * 6.0 - i
+    p = v * (1.0 - s)
+    q = v * (1.0 - f * s)
+    t = v * (1.0 - (1.0 - f) * s)
+
+    i_mod = i % 6
+    out_r = np.select([i_mod == k for k in range(6)], [v, q, p, p, t, v], default=v)
+    out_g = np.select([i_mod == k for k in range(6)], [t, v, v, q, p, p], default=v)
+    out_b = np.select([i_mod == k for k in range(6)], [p, p, t, v, v, q], default=v)
+    return _clip01(np.stack([out_r, out_g, out_b], axis=-1).astype(np.float32))
+
+
+def apply_channel_balance(image: np.ndarray, params: dict[str, float | str]) -> np.ndarray:
+    if image.ndim != 3 or image.shape[2] < 3:
+        return image
+    red = float(params.get("red_balance", 1.0))
+    green = float(params.get("green_balance", 1.0))
+    blue = float(params.get("blue_balance", 1.0))
+    gains = np.array([red, green, blue], dtype=np.float32)
+    return _clip01(image * gains)
+
+
 def apply_saturation(image: np.ndarray, params: dict[str, float | str]) -> np.ndarray:
     if image.ndim != 3 or image.shape[2] < 3:
         return image
@@ -313,6 +367,112 @@ def apply_gaussian_blur(image: np.ndarray, params: dict[str, float | str]) -> np
     return _clip01(blurred)
 
 
+def _gaussian_blur_all_channels(image: np.ndarray, size: float, strength: float) -> np.ndarray:
+    if size <= 0.0 or strength <= 0.0:
+        return image
+    kernel_size = max(1, int(round(size)))
+    kernel = _gaussian_kernel_1d(kernel_size, strength)
+    blurred_data = _convolve_axis(image, kernel, axis=1)
+    return _convolve_axis(blurred_data, kernel, axis=0)
+
+
+def apply_unsharp_mask(image: np.ndarray, params: dict[str, float | str]) -> np.ndarray:
+    radius = float(params.get("radius", 0.0))
+    amount = float(params.get("amount", 0.0))
+    threshold = float(params.get("threshold", 0.0))
+    mode = str(params.get("mode", "Luminance only"))
+
+    if radius <= 0.0 or amount <= 0.0:
+        return image
+
+    if mode == "Luminance only" and image.ndim == 3 and image.shape[2] >= 3:
+        lab = _rgb_to_lab(image)
+        l = lab[..., 0:1]
+        l_blur = _gaussian_blur_all_channels(l, radius, 0.8)
+        detail = l - l_blur
+        if threshold > 0.0:
+            mask = (np.abs(detail) >= threshold).astype(np.float32)
+            detail *= mask
+        lab[..., 0:1] = l + detail * amount
+        return _lab_to_rgb(lab)
+
+    blur = _gaussian_blur_all_channels(image, radius, 0.8)
+    detail = image - blur
+    if threshold > 0.0:
+        mask = (np.abs(detail) >= threshold).astype(np.float32)
+        detail *= mask
+    return _clip01(image + detail * amount)
+
+
+def apply_high_pass_detail(image: np.ndarray, params: dict[str, float | str]) -> np.ndarray:
+    radius = float(params.get("radius", 0.0))
+    amount = float(params.get("amount", 0.0))
+    softness = float(np.clip(float(params.get("softness", 0.0)), 0.0, 1.0))
+    if radius <= 0.0 or amount <= 0.0:
+        return image
+
+    base = _gaussian_blur_all_channels(image, radius, 0.8)
+    detail = image - base
+    if softness > 0.0:
+        limiter = 1.0 - softness * np.clip(np.abs(detail) * 4.0, 0.0, 1.0)
+        detail *= limiter
+    return _clip01(image + detail * amount)
+
+
+def apply_rl_deconvolution(image: np.ndarray, params: dict[str, float | str]) -> np.ndarray:
+    radius = float(params.get("radius", 0.0))
+    iterations = int(round(float(params.get("iterations", 0.0))))
+    damping = float(np.clip(float(params.get("damping", 0.0)), 0.0, 1.0))
+
+    if radius <= 0.0 or iterations <= 0:
+        return image
+
+    work = _clip01(image.astype(np.float32))
+    kernel_size = max(3, int(round(radius * 2.0 + 1.0)))
+    kernel = _gaussian_kernel_1d(kernel_size, 0.9)
+
+    if work.ndim == 3 and work.shape[2] >= 3:
+        lab = _rgb_to_lab(work)
+        estimate = np.clip(lab[..., 0:1] / 100.0, 1e-4, 1.0)
+        observed = estimate.copy()
+        for _ in range(iterations):
+            conv = _convolve_axis(_convolve_axis(estimate, kernel, axis=1), kernel, axis=0)
+            relative_blur = observed / np.clip(conv, 1e-5, None)
+            estimate *= _convolve_axis(_convolve_axis(relative_blur, kernel, axis=1), kernel, axis=0)
+            if damping > 0.0:
+                estimate = (1.0 - damping) * estimate + damping * observed
+            estimate = np.clip(estimate, 0.0, 1.0)
+        lab[..., 0:1] = estimate * 100.0
+        return _lab_to_rgb(lab)
+
+    estimate = np.clip(work, 1e-4, 1.0)
+    observed = estimate.copy()
+    for _ in range(iterations):
+        conv = _convolve_axis(_convolve_axis(estimate, kernel, axis=1), kernel, axis=0)
+        relative_blur = observed / np.clip(conv, 1e-5, None)
+        estimate *= _convolve_axis(_convolve_axis(relative_blur, kernel, axis=1), kernel, axis=0)
+        if damping > 0.0:
+            estimate = (1.0 - damping) * estimate + damping * observed
+        estimate = np.clip(estimate, 0.0, 1.0)
+    return _clip01(estimate)
+
+
+def apply_chroma_denoise(image: np.ndarray, params: dict[str, float | str]) -> np.ndarray:
+    radius = float(params.get("radius", 0.0))
+    strength = float(params.get("strength", 0.0))
+    if radius <= 0.0 or strength <= 0.0:
+        return image
+    if image.ndim != 3 or image.shape[2] < 3:
+        return image
+
+    lab = _rgb_to_lab(image)
+    blurred_ab = lab[..., 1:3].copy()
+    blurred_ab = _gaussian_blur_all_channels(blurred_ab, radius, 0.8)
+    blend = float(np.clip(strength, 0.0, 1.0))
+    lab[..., 1:3] = (1.0 - blend) * lab[..., 1:3] + blend * blurred_ab
+    return _lab_to_rgb(lab)
+
+
 def block_definitions() -> dict[str, BlockDefinition]:
     definitions = {
         "brightness": BlockDefinition(
@@ -357,6 +517,22 @@ def block_definitions() -> dict[str, BlockDefinition]:
                 ),
             ],
             apply_fn=apply_saturation,
+        ),
+        "hue_shift": BlockDefinition(
+            block_type="hue_shift",
+            label="Hue shift",
+            parameters=[ParameterSpec("hue_shift", "Hue shift (°)", -180.0, 180.0, 1.0, 0.0)],
+            apply_fn=apply_hue_shift,
+        ),
+        "channel_balance": BlockDefinition(
+            block_type="channel_balance",
+            label="Channel balance",
+            parameters=[
+                ParameterSpec("red_balance", "Red gain", 0.5, 1.5, 0.01, 1.0),
+                ParameterSpec("green_balance", "Green gain", 0.5, 1.5, 0.01, 1.0),
+                ParameterSpec("blue_balance", "Blue gain", 0.5, 1.5, 0.01, 1.0),
+            ],
+            apply_fn=apply_channel_balance,
         ),
         "midtone_transfer": BlockDefinition(
             block_type="midtone_transfer",
@@ -406,6 +582,55 @@ def block_definitions() -> dict[str, BlockDefinition]:
                 ParameterSpec("lab_balance", "L/AB balance", 0.0, 1.0, 0.01, 0.0),
             ],
             apply_fn=apply_gaussian_blur,
+        ),
+        "unsharp_mask": BlockDefinition(
+            block_type="unsharp_mask",
+            label="Unsharp mask",
+            parameters=[
+                ParameterSpec("radius", "Radius (px)", 0.0, 8.0, 0.05, 0.0),
+                ParameterSpec("amount", "Amount", 0.0, 3.0, 0.01, 0.0),
+                ParameterSpec("threshold", "Threshold", 0.0, 0.2, 0.005, 0.0),
+                ParameterSpec(
+                    "mode",
+                    "Sharpen mode",
+                    0.0,
+                    0.0,
+                    1.0,
+                    "Luminance only",
+                    input_type="choice",
+                    choices=["Luminance only", "All channels"],
+                ),
+            ],
+            apply_fn=apply_unsharp_mask,
+        ),
+        "high_pass_detail": BlockDefinition(
+            block_type="high_pass_detail",
+            label="High-pass detail",
+            parameters=[
+                ParameterSpec("radius", "Radius (px)", 0.0, 10.0, 0.05, 0.0),
+                ParameterSpec("amount", "Amount", 0.0, 3.0, 0.01, 0.0),
+                ParameterSpec("softness", "Halo softness", 0.0, 1.0, 0.01, 0.4),
+            ],
+            apply_fn=apply_high_pass_detail,
+        ),
+        "rl_deconvolution": BlockDefinition(
+            block_type="rl_deconvolution",
+            label="RL deconvolution",
+            parameters=[
+                ParameterSpec("radius", "PSF radius", 0.0, 8.0, 0.05, 0.0),
+                ParameterSpec("iterations", "Iterations", 0.0, 30.0, 1.0, 0.0),
+                ParameterSpec("damping", "Damping", 0.0, 1.0, 0.01, 0.05),
+            ],
+            apply_fn=apply_rl_deconvolution,
+        ),
+        "chroma_denoise": BlockDefinition(
+            block_type="chroma_denoise",
+            label="Chroma denoise",
+            parameters=[
+                ParameterSpec("radius", "Radius (px)", 0.0, 8.0, 0.05, 0.0),
+                ParameterSpec("strength", "Strength", 0.0, 1.0, 0.01, 0.0),
+            ],
+            apply_fn=apply_chroma_denoise,
         ),
     }
     return definitions

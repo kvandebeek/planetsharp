@@ -154,13 +154,24 @@ class MainWindow(QMainWindow):
         library_frame = QFrame()
         library_layout = QVBoxLayout(library_frame)
         library_layout.addWidget(QLabel("Block library"))
-        for key in ["brightness", "contrast", "saturation", "midtone_transfer", "levels", "gaussian_blur"]:
-            row = QHBoxLayout()
-            row.addWidget(QLabel(self.definitions[key].label))
-            btn = QPushButton("->")
-            btn.clicked.connect(lambda _=False, k=key: self.add_block(k))
-            row.addWidget(btn)
-            library_layout.addLayout(row)
+
+        self.library_sections = {
+            "Tone & Dynamic Range": ["brightness", "contrast", "midtone_transfer", "levels"],
+            "Color": ["saturation", "hue_shift", "channel_balance"],
+            "Sharpening & Detail": ["rl_deconvolution", "unsharp_mask", "high_pass_detail"],
+            "Blurring & Denoise": ["gaussian_blur", "chroma_denoise"],
+        }
+        for section, keys in self.library_sections.items():
+            section_label = QLabel(section)
+            section_label.setStyleSheet("font-weight: 600; color: #8AB4F8;")
+            library_layout.addWidget(section_label)
+            for key in keys:
+                row = QHBoxLayout()
+                row.addWidget(QLabel(self.definitions[key].label))
+                btn = QPushButton("->")
+                btn.clicked.connect(lambda _=False, k=key: self.add_block(k))
+                row.addWidget(btn)
+                library_layout.addLayout(row)
         library_layout.addStretch(1)
 
         pipeline_frame = QFrame()
