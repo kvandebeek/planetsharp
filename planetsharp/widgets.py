@@ -100,7 +100,6 @@ class HistogramWidget(QWidget):
         super().__init__()
         self._image: np.ndarray | None = None
         self._mode = "luminance"
-        self._scale = "linear"
         self._levels_overlay: dict[str, dict[str, float]] | None = None
         self._hist_cache: dict[str, list[np.ndarray]] = {}
         self.setMinimumHeight(180)
@@ -114,12 +113,6 @@ class HistogramWidget(QWidget):
         if mode == self._mode:
             return
         self._mode = mode
-        self.update()
-
-    def set_scale(self, scale: str) -> None:
-        if scale == self._scale:
-            return
-        self._scale = scale
         self.update()
 
     def set_levels_overlay(self, payload: dict[str, dict[str, float]] | None) -> None:
@@ -160,23 +153,45 @@ class HistogramWidget(QWidget):
         colors = [Qt.GlobalColor.white] if self._mode == "luminance" else [Qt.GlobalColor.red, Qt.GlobalColor.green, Qt.GlobalColor.blue]
         w = max(1, self.width())
         h = max(1, self.height())
+        section_h = max(1, h // 2)
 
+        self._paint_hist_section(painter, hists, colors, "linear", 0, w, section_h)
+        self._paint_hist_section(painter, hists, colors, "log", section_h, w, h - section_h)
+
+        if self._levels_overlay is not None:
+            self._paint_levels_overlay(painter, w, section_h, top=0)
+            self._paint_levels_overlay(painter, w, h - section_h, top=section_h)
+
+        painter.setPen(Qt.GlobalColor.lightGray)
+        painter.drawText(6, 14, "Linear")
+        painter.drawText(6, section_h + 14, "Log")
+
+    def _paint_hist_section(
+        self,
+        painter: QPainter,
+        hists: list[np.ndarray],
+        colors: list[Qt.GlobalColor],
+        scale: str,
+        top: int,
+        width: int,
+        height: int,
+    ) -> None:
+        if height <= 1:
+            return
+        painter.setClipRect(0, top, width, height)
         for hist, color in zip(hists, colors):
-            values = hist.copy()
-            if self._scale == "log":
-                values = np.log1p(values)
+            values = np.log1p(hist) if scale == "log" else hist.copy()
             maxv = np.max(values) if np.max(values) > 0 else 1.0
             norm = values / maxv
             painter.setPen(QPen(color, 1))
             for x in range(256):
-                px = int((x / 255.0) * (w - 1))
-                bar_h = int(norm[x] * (h - 1))
-                painter.drawLine(px, h - 1, px, h - 1 - bar_h)
+                px = int((x / 255.0) * (width - 1))
+                bar_h = int(norm[x] * (height - 1))
+                y_base = top + height - 1
+                painter.drawLine(px, y_base, px, y_base - bar_h)
+        painter.setClipping(False)
 
-        if self._levels_overlay is not None:
-            self._paint_levels_overlay(painter, w, h)
-
-    def _paint_levels_overlay(self, painter: QPainter, width: int, height: int) -> None:
+    def _paint_levels_overlay(self, painter: QPainter, width: int, height: int, top: int = 0) -> None:
         if self._levels_overlay is None:
             return
         boundaries = self._levels_overlay.get("boundaries", {})
@@ -195,9 +210,9 @@ class HistogramWidget(QWidget):
                 continue
             alpha = int(35 + min(110, abs(amount) * 360))
             tonal_overlay = QColor(255, 255, 255, alpha) if amount >= 0 else QColor(0, 0, 0, alpha)
-            painter.fillRect(x0, 0, x1 - x0, height, tonal_overlay)
+            painter.fillRect(x0, top, x1 - x0, height, tonal_overlay)
             painter.setOpacity(0.30)
-            painter.fillRect(x0, 0, x1 - x0, height, color)
+            painter.fillRect(x0, top, x1 - x0, height, color)
             painter.setOpacity(1.0)
 
         boundary_color = QPen(Qt.GlobalColor.lightGray, 1, Qt.PenStyle.DashLine)
@@ -209,4 +224,4 @@ class HistogramWidget(QWidget):
         ]
         for key in boundary_keys:
             x = int(np.clip(float(boundaries.get(key, 0.0)), 0.0, 1.0) * (width - 1))
-            painter.drawLine(x, 0, x, height - 1)
+            painter.drawLine(x, top, x, top + height - 1)
